@@ -35,9 +35,9 @@ def _price_row(r, cfg, strategic, notice, horizon):
     held_reason=None
     if current<=0:
         proposed=current; held_reason="zero_price"
-    elif current>listp:
-        # Above-list pricing is always held, unconditionally. There is no
-        # config path that raises a price above the configured list price.
+    elif current>=listp:
+        # At or above list: no increase, unconditionally. A price already at
+        # list has nowhere to go without breaching the list ceiling below.
         proposed=current; held_reason="above_list"
     else:
         base=current*(1+float(cfg["increase_pct"])/100)
@@ -53,6 +53,9 @@ def _price_row(r, cfg, strategic, notice, horizon):
             proposed=min(floor,cap_price)
         else:
             proposed=base
+        # List is a ceiling: the policy never creates a new above-list price,
+        # so a below-list line can be raised to list but never through it.
+        proposed=min(proposed,listp)
 
     delta=(proposed-current)*quantity*12
     eligible=date.fromisoformat(r["next_eligible_date"]) if r.get("next_eligible_date") else None
