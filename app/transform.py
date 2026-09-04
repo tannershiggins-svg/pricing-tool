@@ -9,6 +9,9 @@ REQUIRED = {
  "subscriptions": ["subscription_item_id","stripe_customer_id","price_nickname","unit_amount","billing_interval","quantity"],
 }
 
+VALID_BILLING_INTERVALS = {"month","year"}
+VALID_PRODUCTS = {"Hiring","HR","Payroll"}
+
 def norm_name(v):
     return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
 
@@ -18,8 +21,36 @@ def read_csv(file, kind):
     if missing: raise ValueError(f"{kind}: missing required columns: {', '.join(missing)}")
     return df
 
+def _drop_duplicates(df, key, label, issues):
+    dup_mask = df[key].duplicated(keep="first")
+    dup_count = int(dup_mask.sum())
+    if dup_count:
+        issues.append({"severity":"warning","code":f"DUPLICATE_{label.upper()}","count":dup_count,
+                        "message":f"Dropped {dup_count} duplicate {label} row(s) (kept first occurrence of each {key})."})
+        df = df[~dup_mask].copy()
+    return df
+
 def build_rows(accounts, contracts, customers, subscriptions):
     issues=[]
+
+    accounts=_drop_duplicates(accounts,"account_id","accounts",issues)
+    customers=_drop_duplicates(customers,"stripe_customer_id","customers",issues)
+    subscriptions=_drop_duplicates(subscriptions,"subscription_item_id","subscriptions",issues)
+
+    bad_interval=~subscriptions["billing_interval"].astype(str).str.lower().isin(VALID_BILLING_INTERVALS)
+    bad_product=~subscriptions["price_nickname"].isin(VALID_PRODUCTS)
+    bad=bad_interval|bad_product
+    if bad.any():
+        issues.append({"severity":"warning","code":"INVALID_SUBSCRIPTION_ROWS","count":int(bad.sum()),
+                        "message":"Dropped subscriptions with an unrecognized billing_interval (must be month/year) or price_nickname (must be Hiring/HR/Payroll)."})
+        subscriptions=subscriptions[~bad].copy()
+
+    known_customers=set(customers["stripe_customer_id"].dropna().astype(str))
+    orphaned=int((~subscriptions["stripe_customer_id"].astype(str).isin(known_customers)).sum())
+    if orphaned:
+        issues.append({"severity":"warning","code":"ORPHANED_SUBSCRIPTIONS","count":orphaned,
+                        "message":"Subscriptions reference a Stripe customer not present in the customers file."})
+
     for df, cols in [(accounts,["created_date"]),(contracts,["start_date","end_date"]),(customers,["last_billing_date","created"])]:
         for c in cols:
             if c in df: df[c]=pd.to_datetime(df[c], errors="coerce")
@@ -27,26 +58,35 @@ def build_rows(accounts, contracts, customers, subscriptions):
     if pd.isna(latest_bill): raise ValueError("No valid last_billing_date values found")
     analysis_date=latest_bill.normalize()
 
-    # Exact SF ID first; exact normalized company name second. Ambiguous name matches remain unmatched.
+    # Exact SF ID first; exact normalized company name second (only when no SF ID was supplied).
+    # A supplied-but-invalid SF ID is a data-quality issue, not a name-match candidate.
     acct=accounts.copy(); acct["_name"]=acct["account_name"].map(norm_name)
     name_counts=acct.groupby("_name").size().to_dict()
     unique_name={row["_name"]:row["account_id"] for _,row in acct.iterrows() if name_counts.get(row["_name"])==1}
     valid_ids=set(acct["account_id"].dropna().astype(str))
-    cust=customers.copy(); cust["sf_id"]=cust["metadata_salesforce_id"].where(cust["metadata_salesforce_id"].notna(), None)
+    cust=customers.copy(); cust["sf_id"]=None
     cust["match_method"]="unmatched"
+    stale=0
     for i,r in cust.iterrows():
-        sid=str(r["metadata_salesforce_id"]) if pd.notna(r["metadata_salesforce_id"]) else None
-        if sid and sid in valid_ids:
-            cust.at[i,"sf_id"]=sid; cust.at[i,"match_method"]="salesforce_id"
+        raw=r["metadata_salesforce_id"]
+        sid=str(raw) if pd.notna(raw) and str(raw).strip() else None
+        if sid:
+            if sid in valid_ids:
+                cust.at[i,"sf_id"]=sid; cust.at[i,"match_method"]="salesforce_id"
+            else:
+                cust.at[i,"match_method"]="stale_salesforce_id"; stale+=1
         else:
             candidate=unique_name.get(norm_name(r["name"]))
             if candidate:
                 cust.at[i,"sf_id"]=candidate; cust.at[i,"match_method"]="exact_name"
+    if stale: issues.append({"severity":"warning","code":"STALE_SALESFORCE_ID","count":stale,
+                              "message":"Stripe metadata_salesforce_id did not match any account; excluded from matching rather than falling back to name match."})
     unmatched=int((cust["match_method"]=="unmatched").sum())
     if unmatched: issues.append({"severity":"warning","code":"UNMATCHED_CUSTOMERS","count":unmatched,"message":"Stripe customers could not be matched by Salesforce ID or exact normalized name."})
 
-    # One account-level contract record: latest end date. The grain assumption is explicit/documented.
-    csort=contracts.sort_values("end_date", na_position="first")
+    # One account-level contract record. A null end date is evergreen and wins over any dated
+    # contract (including an expired one) for that account.
+    csort=contracts.sort_values("end_date", na_position="last")
     latest_contract=csort.groupby("account_id", as_index=False).tail(1)
     cust=cust.merge(acct.drop(columns=["_name"]), left_on="sf_id", right_on="account_id", how="left")
     cust=cust.merge(latest_contract[["account_id","contract_id","start_date","end_date","contract_term_months"]], on="account_id", how="left")
@@ -59,8 +99,11 @@ def build_rows(accounts, contracts, customers, subscriptions):
         if pd.notna(last):
             active = last >= analysis_date - (timedelta(days=31) if interval=="month" else timedelta(days=366))
         if not active: continue
-        end=r.get("end_date")
-        contract_status="No Contract" if pd.isna(end) else ("In-Term" if end.normalize()>=analysis_date else "Out-of-Term")
+        end=r.get("end_date"); contract_id=r.get("contract_id")
+        if pd.isna(contract_id): contract_status="No Contract"
+        elif pd.isna(end): contract_status="Evergreen"
+        elif end.normalize()>=analysis_date: contract_status="In-Term"
+        else: contract_status="Out-of-Term"
         unit=float(r.get("unit_amount") or 0)/100.0/(12 if interval=="year" else 1)
         qty=float(r.get("quantity") or 0); mrr=unit*qty; arr=mrr*12
         created=r.get("created_date")
