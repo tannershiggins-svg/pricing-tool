@@ -6,8 +6,7 @@ DEFAULT_CONFIG={
  "lists":{"Hiring":78.75,"HR":105.0,"Payroll":14.70},
  "floors":{"Hiring":60.0,"HR":80.0,"Payroll":11.0},
  "high_volume":{"Hiring":7,"HR":7,"Payroll":120},
- "max_increase_pct":20.0,"max_increase_pct_strategic":10.0,
- "legacy_floor_exemption":False,"increase_above_list":False,
+ "max_increase_pct":20.0,
 }
 
 def add_months(d, months):
@@ -36,15 +35,24 @@ def _price_row(r, cfg, strategic, notice, horizon):
     held_reason=None
     if current<=0:
         proposed=current; held_reason="zero_price"
-    elif current>listp and not cfg.get("increase_above_list",False):
+    elif current>listp:
+        # Above-list pricing is always held, unconditionally. There is no
+        # config path that raises a price above the configured list price.
         proposed=current; held_reason="above_list"
     else:
         base=current*(1+float(cfg["increase_pct"])/100)
-        floor_exempt=is_strategic and cfg.get("legacy_floor_exemption",False)
-        target=base if floor_exempt else max(base,floor)
-        cap_pct=float(cfg["max_increase_pct_strategic"]) if is_strategic else float(cfg["max_increase_pct"])
-        capped_price=current*(1+cap_pct/100)
-        proposed=min(target,capped_price)
+        if is_strategic:
+            # Strategic legacy accounts receive the standard increase only.
+            # Floor logic and the cap never apply to them, unconditionally
+            # (not via a toggle) -- they may remain deeply below floor.
+            proposed=base
+        elif base<floor:
+            # Standard accounts: raise beyond the standard increase to close
+            # the floor gap, but never past the floor and never past the cap.
+            cap_price=current*(1+float(cfg["max_increase_pct"])/100)
+            proposed=min(floor,cap_price)
+        else:
+            proposed=base
 
     delta=(proposed-current)*quantity*12
     eligible=date.fromisoformat(r["next_eligible_date"]) if r.get("next_eligible_date") else None
@@ -52,14 +60,16 @@ def _price_row(r, cfg, strategic, notice, horizon):
     realized=effective<=horizon
     months=whole_months_between(effective,horizon) if realized else 0
     realized_revenue=delta*months/12
-    discount=(1-proposed/listp) if listp else 0
+    discount_after=(1-proposed/listp) if listp else 0
+    discount_before=(1-current/listp) if listp else 0
     below_floor_after=proposed<floor
     arr_short_of_floor=(floor-proposed)*quantity*12 if below_floor_after else 0.0
 
     o={**r,"strategic_legacy":is_strategic,"list_price":listp,"floor_price":floor,
        "proposed_unit_price":round(proposed,4),
        "price_change_pct":round((proposed/current-1)*100,3) if current else 0,
-       "discount_from_list_pct":round(discount*100,3),
+       "discount_from_list_pct":round(discount_after*100,3),
+       "discount_from_list_pct_before":round(discount_before*100,3),
        "arr_change":round(delta,2),
        "realized_revenue_in_horizon":round(realized_revenue,2),
        "effective_date":effective.isoformat(),"realized_in_horizon":realized,
@@ -74,6 +84,34 @@ def _price_row(r, cfg, strategic, notice, horizon):
     else: segment="Standard Increase"
     o["segment"]=segment
     return o
+
+def _weighted_avg(rows, weight_key, value_fn):
+    total=sum(r[weight_key] for r in rows)
+    if not total: return 0.0
+    return sum(value_fn(r)*r[weight_key] for r in rows)/total
+
+def _weighted_share(rows, weight_key, predicate):
+    total=sum(r[weight_key] for r in rows)
+    if not total: return 0.0
+    return sum(r[weight_key] for r in rows if predicate(r))/total*100
+
+def _discount_by_ae(rows):
+    by_ae={}
+    for r in rows:
+        by_ae.setdefault(r.get("ae") or "Unassigned", []).append(r)
+    out=[]
+    for ae, rs in by_ae.items():
+        arr_total=sum(r["current_arr"] for r in rs)
+        out.append({
+            "ae": ae,
+            "accounts": len({r["account_key"] for r in rs}),
+            "weighted_avg_discount_pct_before": round((sum(r["discount_from_list_pct_before"]*r["current_arr"] for r in rs)/arr_total) if arr_total else 0.0, 3),
+            "weighted_avg_discount_pct_after": round((sum(r["discount_from_list_pct"]*r["current_arr"] for r in rs)/arr_total) if arr_total else 0.0, 3),
+            "simple_avg_discount_pct_before": round(sum(r["discount_from_list_pct_before"] for r in rs)/len(rs), 3),
+            "simple_avg_discount_pct_after": round(sum(r["discount_from_list_pct"] for r in rs)/len(rs), 3),
+        })
+    out.sort(key=lambda d: -d["weighted_avg_discount_pct_after"])
+    return out
 
 def simulate(rows, config=None, analysis_date=None, horizon_months=12):
     cfg=_merge_config(config)
@@ -106,6 +144,12 @@ def simulate(rows, config=None, analysis_date=None, horizon_months=12):
     realized_arr_weight=sum(r["current_arr"] for r in realized)
     arr_weighted_avg_increase_pct=(sum(r["price_change_pct"]*r["current_arr"] for r in realized)/realized_arr_weight) if realized_arr_weight else 0.0
 
+    # Distribution/discount metrics reflect the full modeled book (not just
+    # what's realized within the horizon) -- this is a snapshot of where
+    # pricing sits today vs. after the proposed change is fully applied.
+    within_10pct_before=lambda r: r["list_price"]>0 and abs(r["unit_price"]/r["list_price"]-1)<=0.10
+    within_10pct_after=lambda r: r["list_price"]>0 and abs(r["proposed_unit_price"]/r["list_price"]-1)<=0.10
+
     summary={"accounts":len(by_account),"subscriptions":len(out),"accounts_affected":len(affected_accounts),
              "strategic_accounts":sum(strategic.values()),
              "floor_normalization_accounts":len({r['account_key'] for r in realized if r['segment']=='Floor Normalize'}),
@@ -121,8 +165,36 @@ def simulate(rows, config=None, analysis_date=None, horizon_months=12):
              "breakeven_accounts":breakeven_accounts,
              "arr_left_below_floor":round(arr_left_below_floor,2),
              "above_list_after_count":sum(1 for r in out if r['above_list_after']),
+             "pct_within_10pct_of_list_before":round(_weighted_share(out,"current_arr",within_10pct_before),2),
+             "pct_within_10pct_of_list_after":round(_weighted_share(out,"current_arr",within_10pct_after),2),
+             "pct_below_floor_before":round(_weighted_share(out,"current_arr",lambda r:r["below_floor_before"]),2),
+             "pct_below_floor_after":round(_weighted_share(out,"current_arr",lambda r:r["below_floor_after"]),2),
+             "discount_from_list_avg_pct_before":round(_weighted_avg(out,"current_arr",lambda r:r["discount_from_list_pct_before"]),3),
+             "discount_from_list_avg_pct_after":round(_weighted_avg(out,"current_arr",lambda r:r["discount_from_list_pct"]),3),
+             "discount_by_ae":_discount_by_ae(out),
              "horizon_end":horizon.isoformat()}
     return {"config":cfg,"summary":summary,"rows":out}
+
+def price_distribution(result):
+    """Per-product before/after unit-price distributions for charting,
+    alongside that product's floor and list price as reference lines."""
+    cfg=result["config"]; rows=result["rows"]
+    by_product={}
+    for r in rows:
+        p=r["product"]
+        entry=by_product.setdefault(p, {
+            "product":p,
+            "floor":float(cfg["floors"].get(p,0)),
+            "list_price":float(cfg["lists"].get(p,0)),
+            "before":[],"after":[],
+        })
+        entry["before"].append(r["unit_price"])
+        entry["after"].append(r["proposed_unit_price"])
+    dist=list(by_product.values())
+    for entry in dist:
+        entry["before"]=sorted(entry["before"])
+        entry["after"]=sorted(entry["after"])
+    return dist
 
 def sensitivity_grid(rows, config=None, analysis_date=None, horizon_months=12, increase_options=None, churn_options=None):
     """Risk-adjusted net ARR across a grid of standard increase % and churn % assumptions."""

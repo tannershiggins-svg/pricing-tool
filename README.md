@@ -10,16 +10,19 @@ A working RevOps prototype for turning messy Salesforce + Stripe exports into a 
 - **Execution readiness:** outputs can be filtered/exported for Finance, Billing, CS, and Marketing workflows.
 - **Handoff:** business logic, data grain, assumptions, and production-hardening steps are documented separately from the UI.
 
-## Case-study default policy (v2: capped glidepath)
+## Case-study default policy
+
+This is a single-cycle, capped-increase pass intended to tighten the pricing distribution around list — not a multi-year mechanism.
 
 - 5% standard annual increase.
 - Existing floors remain Hiring $60, HR $80, Payroll $11.
 - New reference list prices are modeled as +5%: Hiring $78.75, HR $105, Payroll $14.70.
-- Standard accounts are normalized to at least floor, but **no account's price may increase by more than a capped percentage in one cycle** — 20% for standard accounts, 10% for strategic legacy accounts — even when floor normalization would otherwise push it higher. An account the cap leaves short of floor is tracked via `arr_left_below_floor` for the next cycle.
-- Strategic legacy = 3+ years tenure **and** high volume (Hiring 7+, HR 7+, Payroll 120+). By default the floor still applies to them (subject to their gentler cap); the legacy full-exemption behavior is available via a `legacy_floor_exemption` flag for scenarios that need it.
-- Accounts already priced above the configured list price are held (not increased, not reduced) unless `increase_above_list` is enabled.
+- **Standard accounts** below floor after the standard increase are raised further to close the gap, but only up to `min(floor, current * (1 + max_increase_pct/100))` (default cap 20%) — never past the floor, never past the cap. A cap-limited account still short of floor is tracked via `arr_left_below_floor`.
+- **Strategic legacy** accounts (3+ years tenure **and** high volume: Hiring 7+, HR 7+, Payroll 120+) receive the standard increase only — floor logic and the cap never apply to them, unconditionally. They can remain below floor afterward; that gap is still reported (`below_floor_after`, `arr_left_below_floor`), just not acted on.
+- Accounts already priced above the configured list price are always held (not increased, not reduced) — there is no config path that raises a price above list.
 - Subscriptions with a zero or negative unit price are held for review rather than normalized to floor.
 - Contracted accounts wait until renewal; evergreen (null end date) contracts are treated as always current; out-of-term/no-contract accounts move on the next eligible bill date after notice.
+- Distribution/discount reporting shows where pricing sits before vs. after the change: `price_distribution()` per product, the ARR-weighted share within 10% of list and below floor, and ARR-weighted vs. simple average discount from list overall and by AE.
 - Governance/risk outputs include ARR-weighted average increase, realized revenue in horizon (prorated by whole months), breakeven churn %, breakeven account count, and a risk-adjusted sensitivity grid across increase/churn assumptions.
 
 These are scenario defaults, not hard-coded conclusions. See `docs/pricing-logic.md` for the full policy writeup.

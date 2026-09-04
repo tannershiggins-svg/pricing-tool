@@ -1,5 +1,5 @@
 import pandas as pd
-from app.pricing import simulate
+from app.pricing import simulate, price_distribution
 from app.transform import build_rows
 
 ANALYSIS_DATE = "2026-06-15"
@@ -15,24 +15,9 @@ def mk_row(**overrides):
     return row
 
 
-def test_floor_normalization_and_strategic_default():
-    rows = [
-        mk_row(account_key="A", quantity=2, unit_price=58, tenure_years=1),
-        mk_row(account_key="B", quantity=10, unit_price=55, current_arr=6600, tenure_years=4),
-    ]
-    r = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)
-    a, b = r["rows"]
-    assert a["proposed_unit_price"] == 60.9
-    assert b["strategic_legacy"] is True
-    # v2 default: the floor now applies to strategic legacy accounts too (no
-    # exemption unless legacy_floor_exemption is set), capped by the gentler
-    # strategic glidepath rather than jumping straight to floor.
-    assert round(b["proposed_unit_price"], 2) == 60.0
-
-
-def test_glidepath_cap_limits_floor_normalization():
+def test_standard_account_capped_when_cap_binds_before_floor():
     # Far below floor (60): a flat normalize-to-floor would be +50%, but the
-    # standard glidepath cap (default 20%) limits it to current * 1.20.
+    # cap (default 20%) limits the raise to current * 1.20, still short of floor.
     rows = [mk_row(unit_price=40, tenure_years=1)]
     r = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)
     row = r["rows"][0]
@@ -42,45 +27,48 @@ def test_glidepath_cap_limits_floor_normalization():
     assert row["arr_left_below_floor"] == round((60 - 48.0) * 2 * 12, 2)
 
 
-def test_strategic_gentler_cap():
-    # Strategic legacy accounts are capped more tightly (default 10%) than
-    # standard accounts, even though the floor still normally applies to them.
+def test_standard_account_reaches_floor_when_floor_binds_before_cap():
+    # Close enough to floor (60) that current * 1.20 would overshoot it, so
+    # the account is raised only to the floor, not the full cap.
+    rows = [mk_row(unit_price=55, tenure_years=1)]
+    r = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)
+    row = r["rows"][0]
+    assert row["proposed_unit_price"] == 60.0
+    assert round(row["price_change_pct"], 3) == round((60 / 55 - 1) * 100, 3)
+    assert row["below_floor_after"] is False
+    assert row["arr_left_below_floor"] == 0
+
+
+def test_strategic_account_gets_standard_increase_only_regardless_of_cap():
+    # Strategic legacy accounts are exempt from floor logic and the cap by
+    # definition -- not by a toggle -- so they may stay deeply below floor.
     rows = [mk_row(unit_price=40, tenure_years=5, quantity=10)]
-    r = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)
-    row = r["rows"][0]
-    assert row["strategic_legacy"] is True
-    assert row["proposed_unit_price"] == 44.0
-    assert row["price_change_pct"] == 10.0
-
-
-def test_legacy_floor_exemption_restores_old_behavior():
-    # Far enough below floor (60) that the strategic 10% cap keeps the
-    # default (floor-applies) outcome short of the floor.
-    rows = [mk_row(unit_price=50, tenure_years=5, quantity=10)]
     default = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
-    assert default["proposed_unit_price"] == round(50 * 1.10, 4)  # capped en route to floor
-    assert default["below_floor_after"] is True
+    tiny_cap = simulate(rows, config={"max_increase_pct": 1}, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
+    huge_cap = simulate(rows, config={"max_increase_pct": 999}, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
 
-    exempt = simulate(rows, config={"legacy_floor_exemption": True},
-                       analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
-    assert exempt["proposed_unit_price"] == round(50 * 1.05, 4)  # standard increase only, no floor target
+    for row in (default, tiny_cap, huge_cap):
+        assert row["strategic_legacy"] is True
+        assert row["proposed_unit_price"] == 42.0  # 40 * 1.05, standard increase only
+        assert row["price_change_pct"] == 5.0
+        # Still deeply below floor -- reported, but never acted on.
+        assert row["below_floor_after"] is True
+        assert row["arr_left_below_floor"] == round((60 - 42.0) * 10 * 12, 2)
 
 
-def test_above_list_pricing_is_held():
+def test_above_list_pricing_is_held_under_all_configs():
     rows = [mk_row(unit_price=90, tenure_years=1)]  # list price for Hiring is 78.75
-    r = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)
-    row = r["rows"][0]
-    assert row["proposed_unit_price"] == 90.0
-    assert row["arr_change"] == 0
-    assert row["segment"] == "Held (Above List)"
+    default = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
+    assert default["proposed_unit_price"] == 90.0
+    assert default["arr_change"] == 0
+    assert default["segment"] == "Held (Above List)"
 
-
-def test_increase_above_list_flag_allows_increase():
-    rows = [mk_row(unit_price=90, tenure_years=1)]
-    r = simulate(rows, config={"increase_above_list": True}, analysis_date=ANALYSIS_DATE, horizon_months=12)
-    row = r["rows"][0]
-    assert row["proposed_unit_price"] > 90.0
-    assert row["segment"] != "Held (Above List)"
+    # The old increase_above_list config key no longer does anything -- it's
+    # simply ignored, not a way to re-enable raising an above-list price.
+    ignored = simulate(rows, config={"increase_above_list": True, "max_increase_pct": 999},
+                        analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
+    assert ignored["proposed_unit_price"] == 90.0
+    assert ignored["segment"] == "Held (Above List)"
 
 
 def test_zero_or_negative_price_is_held_for_review():
@@ -125,6 +113,65 @@ def test_arr_weighted_average_increase_differs_from_simple_average():
     assert s["avg_unit_increase_pct"] == round(simple_avg, 2)
     assert s["arr_weighted_avg_increase_pct"] == round(weighted_avg, 2)
     assert s["arr_weighted_avg_increase_pct"] != s["avg_unit_increase_pct"]
+
+
+def test_price_distribution_before_after_buckets():
+    rows = [
+        mk_row(account_key="A", product="Hiring", unit_price=45, quantity=1, tenure_years=1),
+        mk_row(account_key="B", product="Hiring", unit_price=90, quantity=1, tenure_years=1),
+        mk_row(account_key="C", product="Payroll", unit_price=12, quantity=1, tenure_years=1),
+    ]
+    result = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)
+    dist = {d["product"]: d for d in price_distribution(result)}
+
+    hiring = dist["Hiring"]
+    assert hiring["floor"] == 60.0
+    assert hiring["list_price"] == 78.75
+    assert hiring["before"] == sorted([45, 90])
+    # 45 -> raised toward floor, capped at min(60, 45*1.2=54) == 54; 90 held above list.
+    assert hiring["after"] == sorted([54.0, 90])
+
+    payroll = dist["Payroll"]
+    assert payroll["floor"] == 11.0
+    assert payroll["list_price"] == 14.70
+    assert payroll["before"] == [12]
+    assert payroll["after"] == [round(12 * 1.05, 4)]
+
+
+def test_pct_within_10pct_of_list_and_pct_below_floor_are_arr_weighted():
+    rows = [
+        # Below list-band before (68 < 70.875), lands within it after (71.4).
+        mk_row(account_key="A", product="Hiring", unit_price=68, quantity=1, current_arr=1000, tenure_years=1),
+        # Below floor before (50 < 60); capped exactly to floor (60) after,
+        # which is not below floor and not within 10% of list (78.75) either.
+        mk_row(account_key="B", product="Hiring", unit_price=50, quantity=1, current_arr=3000, tenure_years=1),
+    ]
+    s = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["summary"]
+    assert s["pct_within_10pct_of_list_before"] == 0.0
+    assert s["pct_within_10pct_of_list_after"] == 25.0  # only account A's 1000 of 4000 total ARR
+    assert s["pct_below_floor_before"] == 75.0  # only account B's 3000 of 4000 total ARR
+    assert s["pct_below_floor_after"] == 0.0
+
+
+def test_discount_by_ae_weighted_vs_simple_average():
+    d1 = (1 - 76 / 78.75) * 100  # small discount, small account
+    d2 = (1 - 60 / 78.75) * 100  # large discount, dominant account
+    rows = [
+        mk_row(account_key="X1", ae="Jordan", product="Hiring", unit_price=76, quantity=1, current_arr=500, tenure_years=1),
+        mk_row(account_key="X2", ae="Jordan", product="Hiring", unit_price=60, quantity=1, current_arr=9500, tenure_years=1),
+    ]
+    s = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["summary"]
+    jordan = next(a for a in s["discount_by_ae"] if a["ae"] == "Jordan")
+    assert jordan["accounts"] == 2
+
+    expected_weighted = (d1 * 500 + d2 * 9500) / 10000
+    expected_simple = (d1 + d2) / 2
+    assert jordan["weighted_avg_discount_pct_before"] == round(expected_weighted, 3)
+    assert jordan["simple_avg_discount_pct_before"] == round(expected_simple, 3)
+    # The dominant (9500 ARR) account's discount should show up in the
+    # weighted number, not the unweighted/simple one.
+    assert abs(jordan["weighted_avg_discount_pct_before"] - d2) < abs(jordan["simple_avg_discount_pct_before"] - d2)
+    assert jordan["weighted_avg_discount_pct_before"] != jordan["simple_avg_discount_pct_before"]
 
 
 def _base_frames():

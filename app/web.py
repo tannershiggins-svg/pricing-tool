@@ -2,7 +2,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, Response
 import hmac, io, csv, logging, os
 from .transform import read_csv, build_rows
-from .pricing import simulate, sensitivity_grid, DEFAULT_CONFIG
+from .pricing import simulate, sensitivity_grid, price_distribution, DEFAULT_CONFIG
 from .db import save_snapshot, get_snapshot, list_snapshots, save_scenario
 
 app=Flask(__name__)
@@ -68,6 +68,13 @@ def api_sensitivity():
     grid=sensitivity_grid(snap['rows'],body.get('config'),snap['analysis_date'],body.get('horizon_months',12),
                            body.get('increase_options'),body.get('churn_options'))
     return jsonify({'grid':grid})
+
+@app.post('/api/distribution')
+def api_distribution():
+    body=request.get_json(force=True); snap=get_snapshot(int(body['snapshot_id']))
+    if not snap: return jsonify({'error':'Snapshot not found'}),404
+    result=simulate(snap['rows'],body.get('config'),snap['analysis_date'],body.get('horizon_months',12))
+    return jsonify({'distribution':price_distribution(result)})
 
 @app.post('/api/export')
 def export():
