@@ -1,0 +1,2 @@
+contract_id,account_id,start_date,end_date,contract_term_months,acv__c,number_of_licenses__c
+800A,001A,2026-01-01,2026-12-31,12,6000,4

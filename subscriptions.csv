@@ -1,0 +1,3 @@
+subscription_item_id,stripe_customer_id,price_nickname,unit_amount,currency,billing_interval,quantity
+siA,cusA,Hiring,5800,usd,month,4
+siB,cusB,Hiring,5500,usd,month,12

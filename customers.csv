@@ -1,0 +1,3 @@
+stripe_customer_id,name,email,last_billing_date,metadata_salesforce_id,created
+cusA,Sample Burgers,billing@sample.test,2026-06-15,001A,2024-01-10
+cusB,Legacy Tacos,billing@legacy.test,2026-06-10,001B,2021-02-01
