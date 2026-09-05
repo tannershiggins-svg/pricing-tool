@@ -31,8 +31,9 @@
     </div>
     <label class="horizon">Horizon
       <select id="horizon" onchange="runSim()">
-        <option>3</option><option>6</option><option selected>12</option><option>18</option><option>24</option>
-      </select> months
+        <option value="all" selected>All time</option>
+        <option>3</option><option>6</option><option>12</option><option>18</option><option>24</option>
+      </select>
     </label>
     <div class="chips" id="chartProducts" title="Filters the charts below. The customer list has its own filters."></div>
   </div>
@@ -146,6 +147,8 @@
     <label>Subscriptions<input type="file" name="subscriptions" accept=".csv" required></label>
     <button class="primary">Validate &amp; Load</button>
   </form>
+  <p style="margin-top:16px">Or start from the bundled case-study extract.</p>
+  <button onclick="loadSample()" style="width:100%">Use Sample Data</button>
   <div id="validation"></div>
 </aside>
 
@@ -156,9 +159,9 @@
   </div>
   <div class="group">
     <h3>Annual adjustment</h3>
-    <label>Standard increase %<input id="increase" type="number" value="5" step=".5" oninput="runSim()"></label>
+    <label>Standard increase %<input id="increase" type="number" value="9" step=".5" oninput="runSim()"></label>
     <label>Notice months<input id="notice" type="number" value="2" min="0" oninput="runSim()"></label>
-    <label>Churn sensitivity %<input id="churn" type="number" value="3" step=".5" oninput="runSim()"></label>
+    <label>Churn sensitivity %<input id="churn" type="number" value="2" step=".5" oninput="runSim()"></label>
   </div>
   <div class="group">
     <h3>Pricing Table</h3>
@@ -172,8 +175,8 @@
   <div class="group">
     <h3>Governance guardrails</h3>
     <p>Off by default. The baseline policy lifts standard accounts below floor straight to floor; these optional guardrails constrain that.</p>
-    <label>Max increase % toward floor<input id="maxInc" type="number" placeholder="no cap" step="1" oninput="runSim()"></label>
-    <label class="checkrow"><input id="capAtList" type="checkbox" onchange="runSim()"> Cap increases at list price</label>
+    <label>Max increase % toward floor<input id="maxInc" type="number" value="20" placeholder="no cap" step="1" oninput="runSim()"></label>
+    <label class="checkrow"><input id="capAtList" type="checkbox" checked onchange="runSim()"> Cap increases at list price</label>
     <p>Raises a price up to list and stops. Anyone already at or above list holds where they are — the cap never moves a price down.</p>
   </div>
   <div class="group">
@@ -211,6 +214,11 @@
 let snapshotId=null,result=null,distribution=[],analysisDate=null,drillRows=[],drillKey=null;
 
 const $=id=>document.getElementById(id);
+// "All time" is simply a horizon long enough that every scheduled increase has
+// taken effect (the book saturates well before 5 years). Same engine, same math.
+const ALL_TIME_MONTHS=120;
+const isAllTime=()=>$('horizon').value==='all';
+const horizonMonths=()=>isAllTime()?ALL_TIME_MONTHS:(num('horizon')||12);
 const F0=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0});
 const F2=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
 const money=x=>F0.format(x||0), money2=x=>F2.format(x||0);
@@ -232,12 +240,11 @@ function closeFly(){document.querySelectorAll('aside.fly').forEach(a=>a.classLis
 function closeDrawer(){$('drawer').classList.remove('open');}
 
 /* ---------------- upload ---------------- */
-$('uploadForm').onsubmit=async e=>{
-  e.preventDefault();
+async function loadSnapshot(form){
   $('validation').innerHTML='Validating…';
-  const r=await fetch('/api/upload',{method:'POST',body:new FormData(e.target)});
+  const r=await fetch('/api/upload',{method:'POST',body:form});
   const j=await r.json();
-  if(!r.ok){$('validation').innerHTML='<b class="bad">'+esc(j.error)+'</b>';return;}
+  if(!r.ok){$('validation').innerHTML='<b class="bad">'+esc(j.error)+'</b>';return false;}
   snapshotId=j.snapshot_id;analysisDate=j.validation.analysis_date;
   $('validation').innerHTML='<b class="good">Loaded '+j.validation.active_accounts+' active accounts / '+
     j.validation.active_subscriptions+' subscriptions.</b><br>Analysis date: '+esc(j.validation.analysis_date)+
@@ -246,12 +253,34 @@ $('uploadForm').onsubmit=async e=>{
     ' subscriptions · as of '+j.validation.analysis_date;
   $('dashboard').classList.remove('hidden');
   await runSim();
-  setTimeout(closeFly,900);
+  return true;
+}
+$('uploadForm').onsubmit=async e=>{
+  e.preventDefault();
+  if(await loadSnapshot(new FormData(e.target))) setTimeout(closeFly,900);
 };
+// The bundled extract is posted through the same /api/upload endpoint as a manual
+// upload, so it is normalized and priced by exactly the same code path.
+const SAMPLE_FILES={accounts:'accounts.csv',contracts:'contracts.csv',
+                    customers:'customers.csv',subscriptions:'subscriptions.csv'};
+async function loadSample(closeAfter){
+  $('validation').innerHTML='Loading sample data…';
+  const form=new FormData();
+  try{
+    for(const [field,file] of Object.entries(SAMPLE_FILES)){
+      const res=await fetch('/static/sample/'+file);
+      if(!res.ok) throw new Error(file);
+      form.append(field,await res.blob(),file);
+    }
+  }catch(err){
+    $('validation').innerHTML='<b class="bad">Could not load the sample files.</b>';return;
+  }
+  if(await loadSnapshot(form)&&closeAfter!==false) setTimeout(closeFly,900);
+}
 
 async function runSim(){
   if(!snapshotId)return;
-  const cfg=config(),horizon=num('horizon')||12;
+  const cfg=config(),horizon=horizonMonths();
   const body=JSON.stringify({snapshot_id:snapshotId,horizon_months:horizon,config:cfg});
   const h={'Content-Type':'application/json'};
   const [r,d]=await Promise.all([
@@ -495,7 +524,10 @@ function drawTimeline(){
   rows.filter(r=>r.realized_in_horizon).forEach(r=>{ev[r.effective_date]=(ev[r.effective_date]||0)+r.arr_change;});
   const dates=Object.keys(ev).sort();
   const t0=new Date((analysisDate||dates[0]||result.summary.horizon_end)+'T00:00:00').getTime();
-  const t1=new Date(result.summary.horizon_end+'T00:00:00').getTime();
+  // On "All time" the horizon end is far past the last increase, so the axis
+  // stops at the last change instead of trailing years of flat line.
+  const endDate=(isAllTime()&&dates.length)?dates[dates.length-1]:result.summary.horizon_end;
+  const t1=new Date(endDate+'T00:00:00').getTime();
   const pts=[{t:t0,v:base}];let v=base;
   dates.forEach(d=>{const t=new Date(d+'T00:00:00').getTime();pts.push({t,v});v+=ev[d];pts.push({t,v});});
   pts.push({t:t1,v});
@@ -521,11 +553,11 @@ function drawTimeline(){
   x.fillStyle='#8fa1b8';x.font='12px system-ui';
   x.fillText(money(base)+' today',padL+4,sy(base)+18);
   x.fillStyle='#50d3a4';
-  const endLabel=money(v)+' at '+result.summary.horizon_end;
+  const endLabel=money(v)+' at '+endDate;
   x.fillText(endLabel,Math.max(padL+4,w-padR-x.measureText(endLabel).width),sy(v)-10);
   x.fillStyle='#6d7f96';x.font='11px system-ui';
   x.fillText((analysisDate||'').slice(0,7),padL,h-10);
-  const el=result.summary.horizon_end.slice(0,7);
+  const el=endDate.slice(0,7);
   x.fillText(el,w-padR-x.measureText(el).width,h-10);
 }
 function stats(vals){
@@ -597,7 +629,7 @@ function drawBell(id,d){
   x.fillText(mx,w-padR-x.measureText(mx).width,h-7);
 }
 window.addEventListener('resize',()=>{if(result){drawTimeline();renderDistributions();}});
-openFly('uploadPanel');
+loadSample(false);
 </script>
 </body>
 </html>
