@@ -90,7 +90,15 @@ def export():
     result=simulate(snap['rows'],body.get('config'),snap['analysis_date'],body.get('horizon_months',12))
     segment=body.get('segment','All'); rows=result['rows'] if segment=='All' else [r for r in result['rows'] if r['segment']==segment]
     include_contact=bool(body.get('include_contact',False))
-    fields=['account_name','csm','ae','product','quantity','unit_price','list_price','floor_price','proposed_unit_price','price_change_pct','discount_from_list_pct','arr_change','realized_revenue_in_horizon','contract_status','contract_end_date','effective_date','tenure_years','segment','strategic_legacy','below_floor_before','above_list_after']
+    # Identifiers first so the export can be joined line-by-line against an
+    # external model, then the derived inputs, then the pricing outputs.
+    fields=['subscription_item_id','stripe_customer_id','salesforce_id','account_key','match_method',
+            'account_name','csm','ae','product','billing_interval','quantity',
+            'unit_price','current_mrr','current_arr','tenure_years','last_billing_date',
+            'contract_status','contract_end_date','next_eligible_date','effective_date','realized_in_horizon',
+            'list_price','floor_price','proposed_unit_price','price_change_pct',
+            'discount_from_list_pct_before','discount_from_list_pct','arr_change','realized_revenue_in_horizon',
+            'segment','strategic_legacy','floor_binds','below_floor_before','below_floor_after','above_list_after','held_reason']
     if include_contact: fields.insert(1,'email')
     s=io.StringIO(); w=csv.DictWriter(s,fieldnames=fields); w.writeheader()
     w.writerows([{k:sanitize_csv_value(r.get(k)) for k in fields} for r in rows])
