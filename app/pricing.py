@@ -6,19 +6,22 @@ DEFAULT_CONFIG={
  "lists":{"Hiring":78.75,"HR":105.0,"Payroll":14.70},
  "floors":{"Hiring":60.0,"HR":80.0,"Payroll":11.0},
  "high_volume":{"Hiring":7,"HR":7,"Payroll":120},
- "max_increase_pct":20.0,
+ # Optional governance guardrails, off by default. The baseline policy is the
+ # case-study policy: standard = max(current x (1+increase), floor), strategic
+ # legacy = current x (1+increase). Each guardrail below is an opt-in overlay.
+ "max_increase_pct":None,        # cap on the floor uplift; None = uncapped
+ "hold_at_or_above_list":False,  # lines at/above list receive no increase
+ "clamp_at_list":False,          # a below-list line may be raised only up to list
+ # Churn is a sensitivity assumption, never a forecast or an elasticity
+ # estimate. "post_increase" applies churn_pct to the post-increase ARR of
+ # affected accounts, which is the more conservative basis.
+ "churn_basis":"post_increase",  # or "pre_increase"
 }
+DAYS_PER_YEAR=365.25
 
 def add_months(d, months):
     m=d.month-1+months; y=d.year+m//12; m=m%12+1
     return date(y,m,min(d.day,monthrange(y,m)[1]))
-
-def whole_months_between(start, end):
-    """Whole months from start to end (end assumed >= start; 0 otherwise)."""
-    if end<=start: return 0
-    months=(end.year-start.year)*12+(end.month-start.month)
-    if end.day<start.day: months-=1
-    return max(0,months)
 
 def _merge_config(config):
     cfg={**DEFAULT_CONFIG, **(config or {})}
@@ -32,37 +35,43 @@ def _price_row(r, cfg, strategic, notice, horizon):
     quantity=float(r["quantity"])
     is_strategic=strategic[r["account_key"]]
 
-    held_reason=None
+    held_reason=None; floor_binds=False
     if current<=0:
         proposed=current; held_reason="zero_price"
-    elif current>=listp:
-        # At or above list: no increase, unconditionally. A price already at
-        # list has nowhere to go without breaching the list ceiling below.
+    elif cfg.get("hold_at_or_above_list") and listp>0 and current>=listp:
         proposed=current; held_reason="above_list"
     else:
         base=current*(1+float(cfg["increase_pct"])/100)
+        # The floor only "binds" when the standard increase alone would have
+        # left the line below it. A line that starts below floor but clears it
+        # on the standard increase is not a floor normalization.
+        floor_binds=not is_strategic and base<floor
         if is_strategic:
             # Strategic legacy accounts receive the standard increase only.
-            # Floor logic and the cap never apply to them, unconditionally
-            # (not via a toggle) -- they may remain deeply below floor.
+            # Floor logic and the cap never apply to them -- they may remain
+            # below floor, and that gap is reported rather than closed.
             proposed=base
         elif base<floor:
-            # Standard accounts: raise beyond the standard increase to close
-            # the floor gap, but never past the floor and never past the cap.
-            cap_price=current*(1+float(cfg["max_increase_pct"])/100)
-            proposed=min(floor,cap_price)
+            # Standard accounts are lifted to floor. With a cap configured the
+            # lift stops at min(floor, current x (1 + cap)), never past either.
+            cap=cfg.get("max_increase_pct")
+            proposed=floor if cap is None else min(floor,current*(1+float(cap)/100))
         else:
             proposed=base
-        # List is a ceiling: the policy never creates a new above-list price,
-        # so a below-list line can be raised to list but never through it.
-        proposed=min(proposed,listp)
+        # A below-list line may be raised up to list but never through it. Only
+        # applied to lines that start at or below list, so the clamp can never
+        # turn into a price decrease.
+        if cfg.get("clamp_at_list") and listp>0 and current<=listp:
+            proposed=min(proposed,listp)
 
     delta=(proposed-current)*quantity*12
     eligible=date.fromisoformat(r["next_eligible_date"]) if r.get("next_eligible_date") else None
     effective=max(eligible,notice) if eligible else notice
     realized=effective<=horizon
-    months=whole_months_between(effective,horizon) if realized else 0
-    realized_revenue=delta*months/12
+    # Run-rate ARR (delta) is annualized and timing-blind. Cumulative revenue
+    # prorates it by the share of a year actually elapsed between the price
+    # taking effect and the end of the horizon.
+    realized_revenue=delta*(horizon-effective).days/DAYS_PER_YEAR if realized else 0.0
     discount_after=(1-proposed/listp) if listp else 0
     discount_before=(1-current/listp) if listp else 0
     below_floor_after=proposed<floor
@@ -78,15 +87,20 @@ def _price_row(r, cfg, strategic, notice, horizon):
        "effective_date":effective.isoformat(),"realized_in_horizon":realized,
        "below_floor_before":current<floor,"below_floor_after":below_floor_after,
        "above_list_after":proposed>listp,"held_reason":held_reason,
+       "floor_binds":floor_binds,
        "arr_left_below_floor":round(arr_short_of_floor,2)}
     if held_reason=="zero_price": segment="Held (Zero Price)"
     elif held_reason=="above_list": segment="Held (Above List)"
     elif not realized: segment="Deferred"
     elif is_strategic: segment="Strategic Legacy"
-    elif current<floor: segment="Floor Normalize"
+    elif floor_binds: segment="Floor Normalize"
     else: segment="Standard Increase"
     o["segment"]=segment
-    return o
+    # Unrounded companions for aggregation. Summing the rounded per-row values
+    # would drift by cents across a large book, so summary figures are built
+    # from these instead.
+    return o,{"arr_change":delta,"realized_revenue":realized_revenue,
+              "arr_left_below_floor":arr_short_of_floor}
 
 def _weighted_avg(rows, weight_key, value_fn):
     total=sum(r[weight_key] for r in rows)
@@ -126,16 +140,25 @@ def simulate(rows, config=None, analysis_date=None, horizon_months=12):
         tenure=max(x["tenure_years"] for x in rs)
         high=any(x["quantity"]>=float(cfg["high_volume"].get(x["product"],10**9)) for x in rs)
         strategic[k]=tenure>=float(cfg["tenure_years"]) and high
-    out=[_price_row(r,cfg,strategic,notice,horizon) for r in rows]
+    priced=[_price_row(r,cfg,strategic,notice,horizon) for r in rows]
+    out=[p[0] for p in priced]; exact=[p[1] for p in priced]
 
     realized=[r for r in out if r["realized_in_horizon"]]
-    expansion=sum(r["arr_change"] for r in realized if r["arr_change"]>0)
-    affected_accounts={r["account_key"] for r in realized if r["arr_change"]>0}
+    gaining=[i for i,r in enumerate(out) if r["realized_in_horizon"] and exact[i]["arr_change"]>0]
+    expansion=sum(exact[i]["arr_change"] for i in gaining)
+    affected_accounts={out[i]["account_key"] for i in gaining}
     current_affected=sum(sum(x["current_arr"] for x in by_account[k]) for k in affected_accounts)
-    churn_loss=current_affected*float(cfg["churn_pct"])/100
-    realized_revenue_total=sum(r["realized_revenue_in_horizon"] for r in out)
-    arr_left_below_floor=sum(r["arr_left_below_floor"] for r in out)
-    breakeven_churn_pct=(expansion/current_affected*100) if current_affected else 0.0
+    # Post-increase ARR of affected accounts: their whole current book plus the
+    # uplift that actually lands inside the horizon.
+    post_increase_affected=current_affected+expansion
+    churn_base=post_increase_affected if cfg.get("churn_basis","post_increase")=="post_increase" else current_affected
+    churn_loss=churn_base*float(cfg["churn_pct"])/100
+    realized_revenue_total=sum(e["realized_revenue"] for e in exact)
+    arr_left_below_floor=sum(e["arr_left_below_floor"] for e in exact)
+    # Break-even churn: the churn rate among affected accounts at which the
+    # uplift nets to zero. Measured on the same basis as the churn sensitivity
+    # so the two numbers are directly comparable.
+    breakeven_churn_pct=(expansion/churn_base*100) if churn_base else 0.0
 
     account_current_arr={k:sum(x["current_arr"] for x in by_account[k]) for k in affected_accounts}
     breakeven_accounts=0
@@ -159,12 +182,22 @@ def simulate(rows, config=None, analysis_date=None, horizon_months=12):
              "deferred_accounts":len({r['account_key'] for r in out if not r['realized_in_horizon']}),
              "held_above_list_accounts":len({r['account_key'] for r in out if r['held_reason']=='above_list'}),
              "held_zero_price_accounts":len({r['account_key'] for r in out if r['held_reason']=='zero_price'}),
-             "gross_arr_expansion":round(expansion,2),"modeled_churn_loss":round(churn_loss,2),
-             "risk_adjusted_net":round(expansion-churn_loss,2),
+             # Run-rate ARR uplift is annualized uplift activated by the horizon.
+             # Cumulative incremental revenue is what is actually earned inside
+             # it. They are different quantities; never use one as the other.
+             "run_rate_arr_uplift":round(expansion,3),
+             "cumulative_incremental_revenue":round(realized_revenue_total,3),
+             "gross_arr_expansion":round(expansion,2),
+             "pre_increase_affected_arr":round(current_affected,3),
+             "post_increase_affected_arr":round(post_increase_affected,3),
+             "churn_basis":cfg.get("churn_basis","post_increase"),
+             "churn_sensitivity_loss":round(churn_loss,3),
+             "modeled_churn_loss":round(churn_loss,2),
+             "risk_adjusted_net":round(expansion-churn_loss,3),
              "avg_unit_increase_pct":round(sum(r['price_change_pct'] for r in realized)/len(realized),2) if realized else 0,
              "arr_weighted_avg_increase_pct":round(arr_weighted_avg_increase_pct,2),
              "realized_revenue_in_horizon":round(realized_revenue_total,2),
-             "breakeven_churn_pct":round(breakeven_churn_pct,2),
+             "breakeven_churn_pct":round(breakeven_churn_pct,4),
              "breakeven_accounts":breakeven_accounts,
              "arr_left_below_floor":round(arr_left_below_floor,2),
              "above_list_after_count":sum(1 for r in out if r['above_list_after']),

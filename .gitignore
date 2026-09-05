@@ -4,3 +4,8 @@ __pycache__/
 .venv/
 venv/
 data/
+
+# Real case-study exports and the validation workbook. Never commit customer
+# data to this repository -- sample-data/ and templates/ are synthetic.
+case-data/
+*.xlsx

@@ -1,5 +1,6 @@
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, Response
+from werkzeug.exceptions import HTTPException
 import hmac, io, csv, logging, os
 from .transform import read_csv, build_rows
 from .pricing import simulate, sensitivity_grid, price_distribution, DEFAULT_CONFIG
@@ -23,6 +24,9 @@ def require_auth():
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
+    # Routing/abort errors carry their own status (404, 405, 413 ...) and must
+    # keep it; only genuinely unexpected failures become an opaque 500.
+    if isinstance(e, HTTPException): return e
     app.logger.exception("Unhandled exception while handling %s %s", request.method, request.path)
     return jsonify({'error': GENERIC_ERROR}), 500
 
@@ -44,7 +48,10 @@ def snapshots(): return jsonify(list_snapshots())
 def upload():
     try:
         dfs={k:read_csv(request.files[k],k) for k in ['accounts','contracts','customers','subscriptions']}
-        rows,validation=build_rows(dfs['accounts'],dfs['contracts'],dfs['customers'],dfs['subscriptions'])
+        # An explicit analysis date pins a reproducible run; omitted, it falls
+        # back to the latest billing date in the uploaded customer file.
+        rows,validation=build_rows(dfs['accounts'],dfs['contracts'],dfs['customers'],dfs['subscriptions'],
+                                    analysis_date=request.form.get('analysis_date') or None)
     except ValueError as e:
         return jsonify({'error':str(e)}),400
     except KeyError as e:

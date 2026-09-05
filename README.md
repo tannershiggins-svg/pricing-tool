@@ -12,20 +12,22 @@ A working RevOps prototype for turning messy Salesforce + Stripe exports into a 
 
 ## Case-study default policy
 
-This is a single-cycle, capped-increase pass intended to tighten the pricing distribution around list — not a multi-year mechanism.
+A single-cycle installed-base increase, anchored to an explicit analysis date.
 
-- 5% standard annual increase.
+- 5% standard annual increase, 2 months notice.
 - Existing floors remain Hiring $60, HR $80, Payroll $11.
 - New reference list prices are modeled as +5%: Hiring $78.75, HR $105, Payroll $14.70.
-- **Standard accounts** below floor after the standard increase are raised further to close the gap, but only up to `min(floor, current * (1 + max_increase_pct/100))` (default cap 20%) — never past the floor, never past the cap. A cap-limited account still short of floor is tracked via `arr_left_below_floor`.
-- **Strategic legacy** accounts (3+ years tenure **and** high volume: Hiring 7+, HR 7+, Payroll 120+) receive the standard increase only — floor logic and the cap never apply to them, unconditionally. They can remain below floor afterward; that gap is still reported (`below_floor_after`, `arr_left_below_floor`), just not acted on.
-- Accounts already priced above the configured list price are always held (not increased, not reduced) — there is no config path that raises a price above list.
-- Subscriptions with a zero or negative unit price are held for review rather than normalized to floor.
-- Contracted accounts wait until renewal; evergreen (null end date) contracts are treated as always current; out-of-term/no-contract accounts move on the next eligible bill date after notice.
-- Distribution/discount reporting shows where pricing sits before vs. after the change: `price_distribution()` per product, the ARR-weighted share within 10% of list and below floor, and ARR-weighted vs. simple average discount from list overall and by AE.
-- Governance/risk outputs include ARR-weighted average increase, realized revenue in horizon (prorated by whole months), breakeven churn %, breakeven account count, and a risk-adjusted sensitivity grid across increase/churn assumptions.
+- **Standard accounts:** `max(current × 1.05, floor)` — the standard increase, lifted to floor if it lands short.
+- **Strategic legacy accounts:** `current × 1.05` only. Floor logic does not apply, so they may remain below floor; the gap is reported, not closed. Qualifying requires 3+ years tenure **and** high volume on at least one product (Hiring 7+, HR 7+, Payroll 120+). Both tests are account-level; a missing tenure fails the tenure half.
+- Subscriptions with a zero or negative unit price are held for review.
+- The policy never produces a decrease.
+- Contracted accounts wait until renewal; evergreen (null end date) contracts count as current; out-of-term/no-contract accounts move on the next eligible bill date, subject to the notice floor.
+- Three **governance guardrails** — a cap on the floor uplift, holding at-or-above-list lines, and clamping increases at list — are available as scenario inputs and are **off by default**.
+- Billing customers resolve to Salesforce accounts by Salesforce ID, then exact normalized name, then exact billing-email domain, then unmatched. Ambiguous candidates are never guessed.
+- Outputs separate **run-rate ARR uplift** (annualized uplift activated by the horizon) from **cumulative incremental revenue** (prorated by days actually elapsed). These are not interchangeable.
+- Churn is a **sensitivity assumption, not a forecast**, applied by default to the post-increase ARR of affected accounts — the conservative basis — and reported alongside a break-even churn rate.
 
-These are scenario defaults, not hard-coded conclusions. See `docs/pricing-logic.md` for the full policy writeup.
+These are scenario defaults, not hard-coded conclusions. See `docs/pricing-logic.md` for the full policy writeup, including the match hierarchy, contract-grain assumption, and the known limitation of a flat churn sensitivity.
 
 ## Run locally
 
@@ -37,6 +39,24 @@ python run.py
 ```
 
 Open `http://127.0.0.1:8000`.
+
+## Reproducing a benchmark
+
+Pin the analysis date so a run is reproducible rather than drifting with the
+data. Via the API, pass `analysis_date` with the upload:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/upload \
+  -F "name=Case Study Benchmark" -F "analysis_date=2026-06-15" \
+  -F "accounts=@sfdc_accounts.csv"      -F "contracts=@sfdc_contracts.csv" \
+  -F "customers=@stripe_customers.csv"  -F "subscriptions=@stripe_subscriptions.csv"
+```
+
+Omit it and the analysis date falls back to the latest `last_billing_date` in
+the customer file.
+
+**Never commit customer exports.** `case-data/` and `*.xlsx` are git-ignored for
+exactly this reason; `sample-data/` and `templates/` hold synthetic data only.
 
 ## Input files
 

@@ -1,5 +1,4 @@
 import re
-from datetime import timedelta
 import pandas as pd
 
 REQUIRED = {
@@ -12,8 +11,28 @@ REQUIRED = {
 VALID_BILLING_INTERVALS = {"month","year"}
 VALID_PRODUCTS = {"Hiring","HR","Payroll"}
 
+# One billing interval back from the analysis date is the activity window: a
+# monthly line must have billed within the last calendar month, an annual line
+# within the last calendar year. Calendar offsets, not 31/366-day subtraction,
+# so the boundary lands on the same day-of-month as the analysis date.
+ACTIVITY_WINDOW = {"month": pd.DateOffset(months=1), "year": pd.DateOffset(years=1)}
+
 def norm_name(v):
-    return re.sub(r"[^a-z0-9]", "", str(v or "").lower())
+    """Normalize a company name for exact matching: '&' and 'and' are treated
+    as the same token, then all punctuation, spacing and case are dropped."""
+    s = str(v or "").lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]", "", s)
+
+def email_domain_key(email):
+    """Normalized billing-email domain, minus its public suffix.
+
+    'billing@perezinc.com' -> 'perezinc', which matches norm_name('Perez Inc').
+    The local part is ignored; only the domain identifies the company.
+    """
+    s = str(email or "").strip().lower()
+    if "@" not in s: return ""
+    domain = s.rsplit("@", 1)[1]
+    return norm_name(domain.split(".")[0])
 
 def read_csv(file, kind):
     df = pd.read_csv(file)
@@ -30,7 +49,14 @@ def _drop_duplicates(df, key, label, issues):
         df = df[~dup_mask].copy()
     return df
 
-def build_rows(accounts, contracts, customers, subscriptions):
+def build_rows(accounts, contracts, customers, subscriptions, analysis_date=None):
+    """Normalize the four source exports into one priced-line book.
+
+    `analysis_date` anchors activity, tenure and contract status. Pass it
+    explicitly (ISO date or datetime) to pin a reproducible benchmark; when
+    omitted it falls back to the latest `last_billing_date` in the customer
+    file, which moves as new data arrives.
+    """
     issues=[]
 
     accounts=_drop_duplicates(accounts,"account_id","accounts",issues)
@@ -54,12 +80,20 @@ def build_rows(accounts, contracts, customers, subscriptions):
     for df, cols in [(accounts,["created_date"]),(contracts,["start_date","end_date"]),(customers,["last_billing_date","created"])]:
         for c in cols:
             if c in df: df[c]=pd.to_datetime(df[c], errors="coerce")
-    latest_bill=customers["last_billing_date"].max()
-    if pd.isna(latest_bill): raise ValueError("No valid last_billing_date values found")
-    analysis_date=latest_bill.normalize()
+    if analysis_date is not None:
+        analysis_date=pd.Timestamp(analysis_date).normalize()
+    else:
+        latest_bill=customers["last_billing_date"].max()
+        if pd.isna(latest_bill): raise ValueError("No valid last_billing_date values found")
+        analysis_date=latest_bill.normalize()
 
-    # Exact SF ID first; exact normalized company name second (only when no SF ID was supplied).
-    # A supplied-but-invalid SF ID is a data-quality issue, not a name-match candidate.
+    # Deterministic match hierarchy, most to least authoritative:
+    #   1. a metadata_salesforce_id that resolves to a real account
+    #   2. exact normalized company name, when it maps to exactly one account
+    #   3. exact normalized billing-email domain, when it maps to exactly one account
+    #   4. otherwise unmatched -- never fuzzy-matched, never guessed
+    # Ambiguous candidates (a normalized key shared by two accounts) are left
+    # unmatched at that tier rather than resolved arbitrarily.
     acct=accounts.copy(); acct["_name"]=acct["account_name"].map(norm_name)
     name_counts=acct.groupby("_name").size().to_dict()
     unique_name={row["_name"]:row["account_id"] for _,row in acct.iterrows() if name_counts.get(row["_name"])==1}
@@ -70,19 +104,21 @@ def build_rows(accounts, contracts, customers, subscriptions):
     for i,r in cust.iterrows():
         raw=r["metadata_salesforce_id"]
         sid=str(raw) if pd.notna(raw) and str(raw).strip() else None
-        if sid:
-            if sid in valid_ids:
-                cust.at[i,"sf_id"]=sid; cust.at[i,"match_method"]="salesforce_id"
-            else:
-                cust.at[i,"match_method"]="stale_salesforce_id"; stale+=1
-        else:
-            candidate=unique_name.get(norm_name(r["name"]))
-            if candidate:
-                cust.at[i,"sf_id"]=candidate; cust.at[i,"match_method"]="exact_name"
+        if sid and sid in valid_ids:
+            cust.at[i,"sf_id"]=sid; cust.at[i,"match_method"]="salesforce_id"
+            continue
+        if sid: stale+=1  # supplied but not a real account: report it, then keep resolving
+        candidate=unique_name.get(norm_name(r["name"]))
+        if candidate:
+            cust.at[i,"sf_id"]=candidate; cust.at[i,"match_method"]="exact_name"
+            continue
+        candidate=unique_name.get(email_domain_key(r["email"]))
+        if candidate:
+            cust.at[i,"sf_id"]=candidate; cust.at[i,"match_method"]="email_domain"
     if stale: issues.append({"severity":"warning","code":"STALE_SALESFORCE_ID","count":stale,
-                              "message":"Stripe metadata_salesforce_id did not match any account; excluded from matching rather than falling back to name match."})
+                              "message":"Stripe metadata_salesforce_id did not match any Salesforce account; resolved by name/email domain instead where possible."})
     unmatched=int((cust["match_method"]=="unmatched").sum())
-    if unmatched: issues.append({"severity":"warning","code":"UNMATCHED_CUSTOMERS","count":unmatched,"message":"Stripe customers could not be matched by Salesforce ID or exact normalized name."})
+    if unmatched: issues.append({"severity":"warning","code":"UNMATCHED_CUSTOMERS","count":unmatched,"message":"Stripe customers could not be matched by Salesforce ID, exact normalized name, or billing-email domain."})
 
     # One account-level contract record. A null end date is evergreen and wins over any dated
     # contract (including an expired one) for that account.
@@ -95,9 +131,9 @@ def build_rows(accounts, contracts, customers, subscriptions):
     rows=[]
     for r in merged.to_dict("records"):
         interval=str(r.get("billing_interval") or "").lower(); last=r.get("last_billing_date")
-        active=False
-        if pd.notna(last):
-            active = last >= analysis_date - (timedelta(days=31) if interval=="month" else timedelta(days=366))
+        # A line with no billing date at all has churned out of the population;
+        # it is dropped, not carried as a $0 row that would dilute every average.
+        active = pd.notna(last) and last >= analysis_date - ACTIVITY_WINDOW[interval]
         if not active: continue
         end=r.get("end_date"); contract_id=r.get("contract_id")
         if pd.isna(contract_id): contract_status="No Contract"
@@ -116,7 +152,7 @@ def build_rows(accounts, contracts, customers, subscriptions):
           "subscription_item_id":r.get("subscription_item_id"),"stripe_customer_id":r.get("stripe_customer_id"),"salesforce_id":None if pd.isna(r.get("account_id")) else r.get("account_id"),
           "account_key":account_key,"account_name":r.get("account_name") if pd.notna(r.get("account_name")) else r.get("name"),"email":r.get("email"),"csm":None if pd.isna(r.get("csm_name__c")) else r.get("csm_name__c"),"ae":None if pd.isna(r.get("account_ae")) else r.get("account_ae"),
           "product":r.get("price_nickname"),"quantity":qty,"billing_interval":interval,"unit_price":round(unit,4),"current_mrr":round(mrr,2),"current_arr":round(arr,2),
-          "tenure_years":round(tenure,3),"last_billing_date":last.date().isoformat() if pd.notna(last) else None,"contract_status":contract_status,"contract_end_date":end.date().isoformat() if pd.notna(end) else None,"next_eligible_date":next_eligible.date().isoformat() if pd.notna(next_eligible) else None,"match_method":r.get("match_method")
+          "tenure_years":round(tenure,6),"last_billing_date":last.date().isoformat() if pd.notna(last) else None,"contract_status":contract_status,"contract_end_date":end.date().isoformat() if pd.notna(end) else None,"next_eligible_date":next_eligible.date().isoformat() if pd.notna(next_eligible) else None,"match_method":r.get("match_method")
         })
     validation={"analysis_date":analysis_date.date().isoformat(),"issues":issues,"unmatched_customers":unmatched,"active_subscriptions":len(rows),"active_accounts":len({r['account_key'] for r in rows})}
     return rows, validation

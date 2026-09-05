@@ -1,62 +1,157 @@
 # Pricing policy logic
 
-## What this is
+How the tool decides a new price for every subscription line, and what each
+number in the output means.
 
-This is a **variance-reduction pass**, not a multi-cycle mechanism. Each run of the simulator answers: "if we applied this one increase cycle today, how much would it tighten the pricing distribution around list, and what's left over?" There is no path-dependence across cycles baked into the tool — running it again next year with a fresh snapshot is a fresh decision, not a continuation of a plan.
+## Matching customers to accounts
 
-## Recommended installed-base policy
+Stripe is the source of truth for billing; Salesforce supplies tenure, contract
+terms and AE/CSM ownership. Billing customers are matched to Salesforce accounts
+in this order:
 
-1. Every active subscription is evaluated for a configurable standard annual increase (default 5%): `current_price * (1 + increase_pct/100)`.
-2. **Held for review, not priced:**
-   - Subscriptions with `unit_price <= 0` are held unchanged. A zero/negative unit price is a data problem, not a pricing decision.
-   - Accounts already priced **at or above** the configured list price are held unchanged (not increased further, not reduced), unconditionally. There is no config flag that re-enables raising such a price — that is a deliberate invariant, not a default.
-3. **Standard accounts** (everyone else): apply the standard increase. If the result is still below the product floor, raise the price further to close the gap — but only up to `min(floor, current_price * (1 + max_increase_pct/100))` (default cap 20%). The account is never pushed past the floor by this rule, and never past the cap. If the cap binds before reaching floor, the shortfall is reported per-row (`arr_left_below_floor`) and in the summary (`arr_left_below_floor`, `pct_below_floor_after`) so it's visible, not hidden.
-4. **List is a ceiling on every priced line.** A below-list line can be raised up to list but never through it — if the standard increase (or the floor uplift, under a floor configured above list) would overshoot, the result is clamped to list. Combined with the hold rule above, this means the policy never creates a *new* above-list price: any line priced above list after a run was already there before it. The clamp applies to strategic legacy lines too — their exemption is from the floor and the cap, not from the list ceiling.
-5. **Strategic legacy accounts** receive the standard increase only — full stop. Floor logic and the cap do not apply to them at all, unconditionally (this is a structural exemption in how strategic accounts are priced, not a toggle to switch on or off). A strategic account can remain deeply below floor after the change; the tool still computes `below_floor_after` and `arr_left_below_floor` for these rows so they show up correctly in reporting, even though no action was taken to close the gap.
-6. A **strategic legacy account** is both:
-   - at or above the configured tenure threshold (a missing/unknown tenure resolves to 0 and therefore fails this test — it never qualifies by default); and
-   - high-volume in at least one product (`quantity >= threshold`, evaluated with OR across the account's products, not AND) using the configured product-specific threshold.
-7. Fixed-term contracts become eligible at contract end/renewal. Evergreen contracts (a real contract row with a null end date) are treated as always current and never lose to an expired dated contract when selecting the operative contract for an account. Out-of-term, evergreen, and no-contract customers become eligible on the next billing date, subject to the notice period.
+1. **Salesforce ID** on the Stripe record, if it points at a real account.
+2. **Company name**, ignoring case, punctuation and spacing (and treating `&`
+   and `and` as the same word) — only if exactly one account matches.
+3. **Billing email domain**, normalized the same way. `billing@perezinc.com`
+   matches `Perez Inc` — only if exactly one account matches.
+4. **Unmatched.**
 
-## Revenue timing: run-rate vs. realized
+If a name or domain could point at two accounts, it matches nothing rather than
+guessing. Nothing is fuzzy-matched. Every row records which rule matched it.
 
-- `arr_change` is the full annualized run-rate delta (current vs. proposed unit price × quantity × 12), independent of when in the horizon it takes effect.
-- `realized_revenue_in_horizon` prorates that delta by the number of *whole months* between the change's effective date and the end of the modeling horizon. A change that lands with only 3 months left in the horizon contributes 3/12 of its annualized value to this field, not the full amount. This is the field that should be summed for an in-horizon cash/revenue view; `arr_change` should not be, since it overstates near-horizon changes.
+Unmatched customers still get priced on their billing data. They have no
+Salesforce account, so they have no tenure and no contract — which means they
+can never qualify as strategic legacy, and they're treated as out-of-term.
 
-## List price and discount representation
+## Which lines count
 
-The new list price is the external/reference price. The tool calculates, per subscription, both before and after the proposed change:
+The **analysis date** anchors everything. Pass it explicitly for a reproducible
+run; otherwise it defaults to the latest billing date in the customer file.
 
-`discount_from_list = 1 - price / list_price`
+A line is active if it billed recently enough:
 
-A negative value means the price is above the configured list price and should be reviewed as a pricing-governance exception. (Per the hold rule above, `discount_from_list` after the change can only be negative for a row that was already above list before the change — the policy itself never creates a new one.)
+- **Monthly:** billed on or after (analysis date − 1 month).
+- **Annual:** billed on or after (analysis date − 1 year).
+- **No billing date:** churned, dropped entirely.
 
-## Why floor is separate from list
+Dropped lines are removed, never kept as $0 rows — carrying them would quietly
+drag down every average and percentage.
 
-The case brief describes list as the Sales-led guideline and floor as the target price needed to support gross-margin targets. The tool therefore treats floor as an internal economic guardrail, not the advertised price.
+Prices arrive in cents, so unit price is `unit_amount / 100`. Annual lines are
+also divided by 12 so they're comparable to monthly ones. Quantity comes from
+Stripe.
 
-## Pricing distribution and discount reporting
+## When the new price takes effect
 
-Because this is a variance-reduction pass, the tool reports where the book of business sits relative to list and floor, both before and after the proposed change, rather than only the increase mechanics:
+Contracts are handled **at the account level** — the data has one contract per
+account. If contracts ever apply per product, this needs revisiting.
 
-- `price_distribution()` returns, per product, the sorted list of unit prices before and after the change alongside that product's floor and list price — meant to be plotted as two distributions with floor/list as vertical reference lines, so you can see the distribution visibly tighten around list.
-- `pct_within_10pct_of_list_before` / `_after` — the ARR-weighted share of subscriptions priced within 10% of that product's list price.
-- `pct_below_floor_before` / `_after` — the ARR-weighted share of subscriptions priced below that product's floor.
-- `discount_from_list_avg_pct_before` / `_after` — the overall ARR-weighted average discount from list.
-- `discount_by_ae` — per AE, both the ARR-weighted and the simple (unweighted) average discount from list, before and after, plus an account count. The weighted and simple figures are reported side by side deliberately: an AE whose discounting is concentrated in one large account will show a weighted average dragged toward that account's discount while the simple average stays close to their typical deal — the gap between the two numbers is itself the signal of inconsistent discounting.
+- No contract → eligible at the next bill.
+- Contract ended before the analysis date → out-of-term, eligible at the next bill.
+- Contract still running → locked until it ends.
 
-These distribution/discount metrics are computed across the full modeled book (not gated by `realized_in_horizon`), since the question they answer is "where would pricing sit if this cycle were fully applied," not "what lands within the horizon."
+"Next bill" means last billing date plus one month (monthly) or one year
+(annual). The change then takes effect at whichever is later: that next-bill
+date, or the analysis date plus the notice period.
 
-## Governance and risk metrics
+Anything that can't take effect inside the reporting horizon is reported as
+deferred, never as realized.
 
-- `gross_arr_expansion` — sum of positive `arr_change` across subscriptions realized within the horizon.
-- `modeled_churn_loss` — the current ARR of accounts receiving an increase, multiplied by the configured `churn_pct` sensitivity input.
-- `risk_adjusted_net` — `gross_arr_expansion - modeled_churn_loss`.
-- `breakeven_churn_pct` — `gross_arr_expansion / ARR exposed to churn`, i.e. the actual churn rate among affected accounts at which the increase cycle would net to zero. Compare this against the configured `churn_pct` sensitivity input as a margin-of-safety check.
-- `breakeven_accounts` — the minimum number of affected accounts (starting from the largest by current ARR) whose combined current ARR would need to churn to offset the gross expansion.
-- `arr_left_below_floor` — total ARR still short of the product floor after this cycle (including strategic accounts, which are exempt by design, and standard accounts the cap left short), summed across all subscriptions.
-- `arr_weighted_avg_increase_pct` — the average price increase percentage, weighted by each subscription's current ARR, alongside the simple (unweighted) `avg_unit_increase_pct`. The weighted figure is what actually drives revenue; the unweighted figure can be skewed by many small accounts.
+## How the new price is set
+
+Per line, because floor and list are product-specific:
+
+- **Standard accounts:** `max(current × (1 + increase), floor)` — apply the
+  standard increase, and if that still lands below the floor, lift to the floor.
+- **Strategic legacy accounts:** `current × (1 + increase)` only. No floor lift,
+  so they can stay below floor. The gap is reported, not closed.
+- **Zero or negative price:** held for review. That's a data problem, not a
+  pricing decision.
+- The policy never lowers a price.
+
+An account is **strategic legacy** if it clears *both* tests:
+
+- tenure at or above the cutoff, **and**
+- high volume on **at least one** product (any one, not all).
+
+Both are account-level: decided once per account, applied to all its lines. An
+account with no tenure on file fails the first test, so it never qualifies by
+accident.
+
+The floor is only said to **bind** when the standard increase alone would have
+left the line short of it. A line that starts below floor but clears it on the
+standard increase is just a standard increase.
+
+### Optional guardrails
+
+Three extra controls, all **off by default**:
+
+| Setting | What it does |
+|---|---|
+| `max_increase_pct` | Caps how far the floor lift can go in one cycle. Bounds the floor lift only — not the standard increase. |
+| `hold_at_or_above_list` | Customers already priced at or above list get nothing. |
+| `clamp_at_list` | A price below list can rise up to list, but never through it. |
+
+Leave all three off and you get the baseline policy above. Turn them on for a
+stricter posture where nothing is ever priced through list.
+
+## The two revenue numbers
+
+These are different and must not be swapped:
+
+- **Run-rate ARR uplift** — the annualized value of every increase that takes
+  effect inside the horizon. A change landing in month 11 still counts its full
+  annual value.
+- **Cumulative incremental revenue** — what you actually collect inside the
+  horizon, prorated by days. That same month-11 change contributes about one
+  twelfth.
+
+Run-rate ARR is not revenue earned. Reporting one as the other badly overstates
+near-term cash.
+
+## Churn sensitivity
+
+There's no price-change experiment in the data, so churn is a **what-if, not a
+forecast**. It answers "what would this cost if X% of affected accounts left".
+
+By default it's applied to the **post-increase ARR** of affected accounts — a
+customer who leaves takes their whole bill, not just the increment — which is
+the conservative choice. Set `churn_basis` to `pre_increase` for the other basis.
+
+`breakeven_churn_pct` is the churn rate at which the uplift nets to zero, on the
+same basis, so it compares directly to your assumption.
+
+**Known limitation:** because the sensitivity is flat, a bigger increase always
+looks better — the model has no built-in optimum and will always favor raising
+prices more. So it's reported alongside the things that *do* carry that signal:
+how many customers are affected, the break-even rate, the spread of
+customer-level increases, and where prices sit relative to floor and list before
+and after.
+
+## Distribution and discount reporting
+
+- `price_distribution()` — prices per product before and after, with floor and
+  list as reference lines.
+- `pct_within_10pct_of_list_before` / `_after` — share of ARR priced near list.
+- `pct_below_floor_before` / `_after` — share of ARR under the floor.
+- `discount_from_list_avg_pct_before` / `_after` — average discount off list,
+  ARR-weighted.
+- `discount_by_ae` — per AE, the ARR-weighted *and* plain average discount, plus
+  an account count. Shown side by side on purpose: when one big discounted
+  account drags the weighted number well below the plain one, that gap is the
+  signal.
+
+These cover the whole book rather than just what lands in the horizon, since
+they answer "where would pricing sit if this cycle were fully applied".
+
+## Counting rules
+
+Any count of customers or accounts is a distinct count — a customer with three
+product lines counts once, never three times. Pricing is per line; strategic
+status, contract status and churn are per account.
 
 ## Sensitivity grid
 
-`sensitivity_grid()` runs the simulation across a grid of standard increase % and churn % assumptions and returns the resulting `gross_arr_expansion`, `modeled_churn_loss`, and `risk_adjusted_net` for each combination, so a scenario's risk-adjusted outcome can be stress-tested against a range of plausible churn responses rather than a single point estimate.
+`sensitivity_grid()` re-runs the model across a range of increase and churn
+assumptions, so an outcome can be stress-tested instead of resting on one
+guess.
