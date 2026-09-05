@@ -1,9 +1,10 @@
+from contextlib import contextmanager
 from pathlib import Path
-import json, sqlite3
+import json, os, sqlite3
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "data" / "pricing_governance.db"
+DB_PATH = Path(os.environ.get("DB_PATH", str(ROOT / "data" / "pricing_governance.db")))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -27,12 +28,20 @@ CREATE TABLE IF NOT EXISTS scenarios (
 );
 """
 
+@contextmanager
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
-    return c
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 def save_snapshot(name, analysis_date, rows, validation):
     account_count = len({r["account_key"] for r in rows})

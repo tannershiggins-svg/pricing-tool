@@ -1,30 +1,635 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pricing Governance Simulator</title><link rel="stylesheet" href="/static/style.css"></head>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pricing Governance Simulator</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
 <body>
-<header><div><span class="eyebrow">REVOPS PRICING GOVERNANCE</span><h1>Pricing Increase Simulator</h1><p>Upload a billing snapshot, validate the model, adjust policy, and export execution lists.</p></div><button onclick="openPanel()">Scenario controls</button></header>
+
+<header>
+  <div>
+    <span class="eyebrow">REVOPS PRICING GOVERNANCE</span>
+    <h1>Pricing Increase Simulator</h1>
+    <p>Where pricing sits today, how the proposed cycle changes it, and who is affected.</p>
+  </div>
+  <div class="actions">
+    <button onclick="openFly('uploadPanel')">Upload Files</button>
+    <button class="primary" onclick="openFly('panel')">Scenario controls</button>
+  </div>
+</header>
+
 <main>
-<section class="upload" id="uploadBox"><div><h2>1. Load a pricing snapshot</h2><p>Four standardized CSV inputs. Data is normalized and persisted locally in SQLite.</p></div><form id="uploadForm"><input name="name" value="Case Study Snapshot"><label>Accounts<input type="file" name="accounts" accept=".csv" required></label><label>Contracts<input type="file" name="contracts" accept=".csv" required></label><label>Stripe Customers<input type="file" name="customers" accept=".csv" required></label><label>Subscriptions<input type="file" name="subscriptions" accept=".csv" required></label><button>Validate & Load</button></form><div id="validation"></div></section>
 <section id="dashboard" class="hidden">
-<div class="toolbar"><div><span>Snapshot</span><b id="snapshotName">Loaded snapshot</b></div><label>Horizon<select id="horizon" onchange="runSim()"><option>6</option><option selected>12</option><option>18</option><option>24</option></select> months</label><button onclick="exportCSV('All')">Export index</button></div>
-<div class="kpis"><article><span>Accounts affected</span><b id="affected">—</b></article><article><span>Strategic legacy</span><b id="strategic">—</b></article><article><span>Floor normalization</span><b id="floorNorm">—</b></article><article><span>Avg unit increase</span><b id="avgInc">—</b></article><article><span>Gross ARR expansion</span><b id="gross">—</b></article><article><span>Risk-adjusted net</span><b id="net">—</b></article></div>
-<div class="grid"><article class="card"><h3>Account treatment</h3><div id="treatment"></div></article><article class="card"><h3>Revenue timeline</h3><canvas id="timeline" width="760" height="280"></canvas></article></div>
-<article class="card"><div class="cardhead"><div><h3>Execution index</h3><p>Click any segment to filter. Negative “discount from list” flags legacy pricing above the new reference list.</p></div><div id="tabs"></div></div><div class="tablewrap"><table><thead><tr><th>Account</th><th>Product</th><th>Qty</th><th>Current</th><th>List</th><th>Floor</th><th>Proposed</th><th>Change %</th><th>Discount vs List</th><th>ARR Δ</th><th>Effective</th><th>Segment</th></tr></thead><tbody id="tbody"></tbody></table></div></article>
-</section></main>
-<aside id="panel"><div class="panelhead"><div><span class="eyebrow">POLICY ENGINE</span><h2>Scenario controls</h2></div><button onclick="closePanel()">×</button></div>
-<div class="group"><h3>Annual adjustment</h3><label>Standard increase %<input id="increase" type="number" value="5" step=".5" oninput="runSim()"></label><label>Notice months<input id="notice" type="number" value="2" min="0" oninput="runSim()"></label><label>Churn sensitivity %<input id="churn" type="number" value="3" step=".5" oninput="runSim()"></label></div>
-<div class="group"><h3>List price / floor</h3><div class="matrix"><b></b><b>List</b><b>Floor</b><span>Hiring</span><input id="hList" value="78.75"><input id="hFloor" value="60"><span>HR</span><input id="hrList" value="105"><input id="hrFloor" value="80"><span>Payroll</span><input id="pList" value="14.70"><input id="pFloor" value="11"></div></div>
-<div class="group"><h3>Strategic legacy exception</h3><p>Legacy + high-volume accounts still receive the standard increase but may remain below floor.</p><label>Minimum tenure (years)<input id="tenure" type="number" value="3" step=".25"></label><div class="matrix"><b></b><b>High volume</b><b></b><span>Hiring</span><input id="hVol" value="7"><b>locations</b><span>HR</span><input id="hrVol" value="7"><b>locations</b><span>Payroll</span><input id="pVol" value="120"><b>employees</b></div><button class="primary" onclick="runSim()">Apply scenario</button></div>
-<div class="group"><button onclick="saveScenario()">Save scenario to database</button></div></aside><div id="shade" onclick="closePanel()"></div>
-<script>let snapshotId=null, result=null, activeTab='All';
-const $=id=>document.getElementById(id), money=x=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(x||0), num=id=>parseFloat($(id).value)||0;
-function config(){return {increase_pct:num('increase'),notice_months:num('notice'),churn_pct:num('churn'),tenure_years:num('tenure'),lists:{Hiring:num('hList'),HR:num('hrList'),Payroll:num('pList')},floors:{Hiring:num('hFloor'),HR:num('hrFloor'),Payroll:num('pFloor')},high_volume:{Hiring:num('hVol'),HR:num('hrVol'),Payroll:num('pVol')},enforce_floor_for_strategic:false}}
-$('uploadForm').onsubmit=async e=>{e.preventDefault();$('validation').innerHTML='Validating…';let r=await fetch('/api/upload',{method:'POST',body:new FormData(e.target)}),j=await r.json();if(!r.ok){$('validation').innerHTML='<b class="bad">'+j.error+'</b>';return}snapshotId=j.snapshot_id;$('validation').innerHTML=`<b class="good">Loaded ${j.validation.active_accounts} active accounts / ${j.validation.active_subscriptions} subscriptions.</b> Analysis date: ${j.validation.analysis_date}. Unmatched billing customers: ${j.validation.unmatched_customers}.`;$('dashboard').classList.remove('hidden');runSim()};
-async function runSim(){if(!snapshotId)return;let r=await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({snapshot_id:snapshotId,horizon_months:num('horizon')||12,config:config()})});result=await r.json();render()}
-function render(){let s=result.summary;$('affected').textContent=s.accounts_affected;$('strategic').textContent=s.strategic_accounts;$('floorNorm').textContent=s.floor_normalization_accounts;$('avgInc').textContent=s.avg_unit_increase_pct.toFixed(1)+'%';$('gross').textContent=money(s.gross_arr_expansion);$('net').textContent=money(s.risk_adjusted_net);renderTreatment();renderTable();drawTimeline()}
-function renderTreatment(){let groups={};result.rows.forEach(r=>{groups[r.segment]=(groups[r.segment]||new Set()).add(r.account_key)});$('treatment').innerHTML=Object.entries(groups).map(([k,v])=>`<div class="barrow" onclick="setTab('${k}')"><span>${k}</span><i><em style="width:${Math.min(100,v.size/result.summary.accounts*100)}%"></em></i><b>${v.size}</b></div>`).join('');let tabs=['All',...Object.keys(groups)];$('tabs').innerHTML=tabs.map(t=>`<button class="${activeTab==t?'active':''}" onclick="setTab('${t}')">${t}</button>`).join('')}
-function setTab(t){activeTab=t;renderTreatment();renderTable()}
-function renderTable(){let rr=activeTab==='All'?result.rows:result.rows.filter(r=>r.segment===activeTab);$('tbody').innerHTML=rr.slice(0,500).map(r=>`<tr><td>${r.account_name||'—'}</td><td>${r.product}</td><td>${r.quantity}</td><td>${money(r.unit_price)}</td><td>${money(r.list_price)}</td><td>${money(r.floor_price)}</td><td>${money(r.proposed_unit_price)}</td><td>${r.price_change_pct.toFixed(1)}%</td><td class="${r.discount_from_list_pct<0?'bad':''}">${r.discount_from_list_pct.toFixed(1)}%</td><td>${money(r.arr_change)}</td><td>${r.effective_date}</td><td><span class="pill">${r.segment}</span></td></tr>`).join('')}
-function drawTimeline(){let c=$('timeline'),x=c.getContext('2d'),w=c.width,h=c.height;x.clearRect(0,0,w,h);let base=result.rows.reduce((a,r)=>a+r.current_arr,0), events={};result.rows.forEach(r=>{events[r.effective_date]=(events[r.effective_date]||0)+r.arr_change});let dates=Object.keys(events).sort(),vals=[base],labels=['Now'],v=base;dates.forEach(d=>{v+=events[d];vals.push(v);labels.push(d.slice(0,7))});let min=Math.min(...vals)*.98,max=Math.max(...vals)*1.02;x.strokeStyle='#334155';x.beginPath();x.moveTo(45,20);x.lineTo(45,h-35);x.lineTo(w-15,h-35);x.stroke();x.strokeStyle='#64d8b4';x.lineWidth=3;x.beginPath();vals.forEach((z,i)=>{let px=45+i*(w-70)/Math.max(1,vals.length-1),py=20+(max-z)/(max-min||1)*(h-65);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.fillStyle='#94a3b8';x.font='12px system-ui';x.fillText(money(base)+' baseline',55,35);x.fillText(money(vals[vals.length-1])+' projected',w-165,35)}
-function openPanel(){$('panel').classList.add('open');$('shade').classList.add('open')}function closePanel(){$('panel').classList.remove('open');$('shade').classList.remove('open')}
-async function saveScenario(){if(!snapshotId)return;await fetch('/api/simulate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({snapshot_id:snapshotId,horizon_months:num('horizon')||12,config:config(),save:true,scenario_name:'Saved scenario'})});alert('Scenario saved to SQLite.')}
-async function exportCSV(segment){if(!snapshotId)return;let r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({snapshot_id:snapshotId,horizon_months:num('horizon')||12,config:config(),segment:activeTab})});let b=await r.blob(),u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='pricing_export.csv';a.click();URL.revokeObjectURL(u)}
-</script></body></html>
+
+  <div class="toolbar">
+    <div class="snap">
+      <span>Snapshot</span>
+      <b id="snapshotName">—</b>
+    </div>
+    <label class="horizon">Horizon
+      <select id="horizon" onchange="runSim()">
+        <option value="all" selected>All time</option>
+        <option>3</option><option>6</option><option>12</option><option>18</option><option>24</option>
+      </select>
+    </label>
+    <div class="chips" id="chartProducts" title="Filters the charts below. The customer list has its own filters."></div>
+  </div>
+
+  <div class="sechead">
+    <h2>Account-level impact</h2>
+    <p>Who moves, and where pricing lands against floor and list. Click any tile for the customer list behind it.</p>
+  </div>
+  <div class="tiles">
+    <article class="tile" onclick="drill('increased')"><span class="drill">View customers →</span>
+      <span class="lbl">Accounts increased</span><b class="val" id="tAffected">—</b><span class="sub" id="tAffectedSub">—</span></article>
+    <article class="tile t-purple" onclick="drill('avgIncrease')"><span class="drill">View customers →</span>
+      <span class="lbl">Average price increase</span><b class="val" id="tAvgInc">—</b><span class="sub" id="tAvgIncSub">—</span></article>
+    <article class="tile" id="tileBelowPct" onclick="drill('belowFloor')"><span class="drill">View customers →</span>
+      <span class="lbl">ARR below floor</span><b class="val" id="tBelowPct">—</b><span class="sub">share of ARR priced under floor</span></article>
+    <article class="tile" id="tileBelowArr" onclick="drill('belowFloor')"><span class="drill">View customers →</span>
+      <span class="lbl">Dollars below floor</span><b class="val" id="tBelowArr">—</b><span class="sub">annual gap to floor pricing</span></article>
+    <article class="tile" id="tileDiscount" onclick="drill('discount')"><span class="drill">View customers →</span>
+      <span class="lbl">Avg discount from list</span><b class="val" id="tDiscount">—</b><span class="sub" id="tDiscountSub">ARR-weighted, whole book</span></article>
+    <article class="tile t-warn" onclick="drill('breakeven')"><span class="drill">View customers →</span>
+      <span class="lbl">Break-even churn</span><b class="val" id="tBreakeven">—</b><span class="sub" id="tBreakevenSub">—</span></article>
+    <article class="tile t-purple" onclick="drill('strategic')"><span class="drill">View customers →</span>
+      <span class="lbl">Strategic legacy</span><b class="val" id="tStrategic">—</b><span class="sub">standard increase only, no floor lift</span></article>
+    <article class="tile" onclick="drill('floorNorm')"><span class="drill">View customers →</span>
+      <span class="lbl">Floor normalization</span><b class="val" id="tFloorNorm">—</b><span class="sub">lifted to floor by this cycle</span></article>
+  </div>
+
+  <div class="sechead">
+    <h2>Revenue impact</h2>
+    <p>Annualized run-rate at the end of the horizon. Churn is a sensitivity assumption, not a forecast.</p>
+  </div>
+  <div class="tiles">
+    <article class="tile t-good" onclick="drill('increased')"><span class="drill">View customers →</span>
+      <span class="lbl">Revenue increase</span><b class="val" id="tGross">—</b><span class="sub">run-rate ARR uplift activated in horizon</span></article>
+    <article class="tile t-bad" onclick="drill('churn')"><span class="drill">View customers →</span>
+      <span class="lbl">Decrease from churn</span><b class="val" id="tChurn">—</b><span class="sub" id="tChurnSub">—</span></article>
+    <article class="tile t-good" onclick="drill('increased')"><span class="drill">View customers →</span>
+      <span class="lbl">Net after churn</span><b class="val" id="tNet">—</b><span class="sub">increase minus churn sensitivity</span></article>
+    <article class="tile t-warn" onclick="drill('deferred')"><span class="drill">View customers →</span>
+      <span class="lbl">Deferred outside horizon</span><b class="val" id="tDeferred">—</b><span class="sub" id="tDeferredSub">—</span></article>
+  </div>
+
+  <div class="grid2" style="margin-top:22px">
+    <article class="card">
+      <h3>Account treatment</h3>
+      <p style="font-size:12px">How each account is handled. Click a bar to filter the customer list.</p>
+      <div id="treatment" style="margin-top:10px"></div>
+    </article>
+    <article class="card">
+      <div class="cardhead">
+        <div><h3>ARR timeline</h3><p style="font-size:12px">Book ARR with no change, against ARR as increases take effect through the horizon.</p></div>
+      </div>
+      <canvas id="timeline"></canvas>
+      <div class="legend">
+        <span><i style="background:#8fa1b8"></i>No change (baseline)</span>
+        <span><i style="background:#50d3a4"></i>With proposed changes</span>
+      </div>
+    </article>
+  </div>
+
+  <article class="card">
+    <div class="cardhead">
+      <div><h3>Portfolio price distribution</h3>
+      <p style="font-size:12px">Where unit prices sit before and after the cycle. A taller, narrower curve sitting closer to list means pricing has normalized.</p></div>
+    </div>
+    <div id="distCharts" class="distgrid"></div>
+    <div class="legend">
+      <span><i style="background:#8fa1b8"></i>Before</span>
+      <span><i style="background:#50d3a4"></i>After</span>
+      <span><i style="background:#ff7d8e"></i>Floor</span>
+      <span><i style="background:#b894ff"></i>List</span>
+      <span>Dotted vertical = mean price</span>
+    </div>
+  </article>
+
+  <article class="card" id="customersCard">
+    <div class="cardhead">
+      <div><h3>Customers</h3><p style="font-size:12px">Every priced line. Filter to a segment and export it for CS outreach or a marketing sequence.</p></div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <label class="checkrow" title="Billing email is excluded by default."><input type="checkbox" id="inclEmail"> Include email</label>
+        <button class="primary" onclick="exportCSV()">Export to CSV</button>
+      </div>
+    </div>
+    <div class="filters">
+      <div class="field">AE<select id="fAe" onchange="renderTable()"></select></div>
+      <div class="field">CSM<select id="fCsm" onchange="renderTable()"></select></div>
+      <div class="field">Segment<select id="fSegment" onchange="renderTable()"></select></div>
+      <div class="field">Product<div class="multi" id="fProduct"></div></div>
+      <div class="field">Search<input id="fSearch" placeholder="Account name…" oninput="renderTable()"></div>
+    </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Account</th><th class="l">Segment</th><th class="l">AE</th><th class="l">CSM</th><th class="l">Product</th><th>Qty</th><th>Current</th><th>List</th><th>Floor</th><th>Proposed</th><th>Change %</th><th>Discount vs list</th><th>ARR &Delta;</th><th>Effective</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table></div>
+    <div class="rowcount" id="rowCount"></div>
+  </article>
+
+</section>
+</main>
+
+<aside class="fly" id="uploadPanel">
+  <div class="flyhead">
+    <div><span class="eyebrow">DATA</span><h2>Upload Files</h2></div>
+    <button class="ghost" onclick="closeFly()">&times;</button>
+  </div>
+  <p>Four standardized CSV inputs. Data is normalized and persisted locally in SQLite.</p>
+  <form id="uploadForm">
+    <label>Accounts<input type="file" name="accounts" accept=".csv" required></label>
+    <label>Contracts<input type="file" name="contracts" accept=".csv" required></label>
+    <label>Stripe Customers<input type="file" name="customers" accept=".csv" required></label>
+    <label>Subscriptions<input type="file" name="subscriptions" accept=".csv" required></label>
+    <button class="primary">Validate &amp; Load</button>
+  </form>
+  <p style="margin-top:16px">Or start from the bundled case-study extract.</p>
+  <button onclick="loadSample()" style="width:100%">Use Sample Data</button>
+  <div id="validation"></div>
+</aside>
+
+<aside class="fly" id="panel">
+  <div class="flyhead">
+    <div><span class="eyebrow">POLICY ENGINE</span><h2>Scenario controls</h2></div>
+    <button class="ghost" onclick="closeFly()">&times;</button>
+  </div>
+  <div class="group">
+    <h3>Annual adjustment</h3>
+    <label>Standard increase %<input id="increase" type="number" value="9" step=".5" oninput="runSim()"></label>
+    <label>Notice months<input id="notice" type="number" value="2" min="0" oninput="runSim()"></label>
+    <label>Churn sensitivity %<input id="churn" type="number" value="2" step=".5" oninput="runSim()"></label>
+  </div>
+  <div class="group">
+    <h3>Pricing Table</h3>
+    <div class="matrix">
+      <b></b><b>List</b><b>Floor</b>
+      <span>Hiring</span><input id="hList" value="75" oninput="runSim()"><input id="hFloor" value="60" oninput="runSim()">
+      <span>HR</span><input id="hrList" value="100" oninput="runSim()"><input id="hrFloor" value="80" oninput="runSim()">
+      <span>Payroll</span><input id="pList" value="14" oninput="runSim()"><input id="pFloor" value="11" oninput="runSim()">
+    </div>
+  </div>
+  <div class="group">
+    <h3>Governance guardrails</h3>
+    <p>Off by default. The baseline policy lifts standard accounts below floor straight to floor; these optional guardrails constrain that.</p>
+    <label>Max increase % toward floor<input id="maxInc" type="number" value="20" placeholder="no cap" step="1" oninput="runSim()"></label>
+    <label class="checkrow"><input id="capAtList" type="checkbox" checked onchange="runSim()"> Cap increases at list price</label>
+    <p>Raises a price up to list and stops. Anyone already at or above list holds where they are — the cap never moves a price down.</p>
+  </div>
+  <div class="group">
+    <h3>Strategic legacy exception</h3>
+    <p>Legacy + high-volume accounts receive the standard increase only. Floor logic and the cap never apply to them — they may remain below floor afterward.</p>
+    <label>Minimum tenure (years)<input id="tenure" type="number" value="3" step=".25" oninput="runSim()"></label>
+    <div class="matrix">
+      <b></b><b>High volume</b><b></b>
+      <span>Hiring</span><input id="hVol" value="7" oninput="runSim()"><b>locations</b>
+      <span>HR</span><input id="hrVol" value="7" oninput="runSim()"><b>locations</b>
+      <span>Payroll</span><input id="pVol" value="120" oninput="runSim()"><b>employees</b>
+    </div>
+  </div>
+  <div class="group"><p>Every control above recalculates the dashboard as you change it.</p></div>
+</aside>
+
+<div id="shade" onclick="closeFly()"></div>
+
+<section id="drawer">
+  <div class="flyhead">
+    <div><span class="eyebrow">CUSTOMER DRILL-DOWN</span><h2 id="drawerTitle">—</h2><p id="drawerDesc"></p></div>
+    <div style="display:flex;gap:10px">
+      <button class="ghost" onclick="exportDrill()">Export to CSV</button>
+      <button class="ghost" onclick="closeDrawer()">&times;</button>
+    </div>
+  </div>
+  <div class="tablewrap" style="max-height:calc(74vh - 150px)"><table>
+    <thead><tr><th>Account</th><th class="l">Segment</th><th class="l">AE</th><th class="l">CSM</th><th class="l">Product</th><th>Qty</th><th>Current</th><th>List</th><th>Floor</th><th>Proposed</th><th>Change %</th><th>Discount vs list</th><th>ARR &Delta;</th><th>Effective</th></tr></thead>
+    <tbody id="drawerBody"></tbody>
+  </table></div>
+  <div class="rowcount" id="drawerCount"></div>
+</section>
+
+<script>
+let snapshotId=null,result=null,distribution=[],analysisDate=null,drillRows=[],drillKey=null;
+
+const $=id=>document.getElementById(id);
+// "All time" is simply a horizon long enough that every scheduled increase has
+// taken effect (the book saturates well before 5 years). Same engine, same math.
+const ALL_TIME_MONTHS=120;
+const isAllTime=()=>$('horizon').value==='all';
+const horizonMonths=()=>isAllTime()?ALL_TIME_MONTHS:(num('horizon')||12);
+const F0=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0});
+const F2=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:2,maximumFractionDigits:2});
+const money=x=>F0.format(x||0), money2=x=>F2.format(x||0);
+const pct=(x,d)=>(x||0).toFixed(d===undefined?1:d)+'%';
+const num=id=>parseFloat($(id).value)||0;
+const optNum=id=>$(id).value.trim()===''?null:parseFloat($(id).value);
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function config(){return{
+  increase_pct:num('increase'),notice_months:num('notice'),churn_pct:num('churn'),tenure_years:num('tenure'),
+  lists:{Hiring:num('hList'),HR:num('hrList'),Payroll:num('pList')},
+  floors:{Hiring:num('hFloor'),HR:num('hrFloor'),Payroll:num('pFloor')},
+  high_volume:{Hiring:num('hVol'),HR:num('hrVol'),Payroll:num('pVol')},
+  max_increase_pct:optNum('maxInc'),cap_at_list:$('capAtList').checked};}
+
+/* ---------------- flyouts / drawer ---------------- */
+function openFly(id){document.querySelectorAll('aside.fly').forEach(a=>a.classList.remove('open'));$(id).classList.add('open');$('shade').classList.add('open');}
+function closeFly(){document.querySelectorAll('aside.fly').forEach(a=>a.classList.remove('open'));$('shade').classList.remove('open');}
+function closeDrawer(){$('drawer').classList.remove('open');}
+
+/* ---------------- upload ---------------- */
+async function loadSnapshot(form){
+  $('validation').innerHTML='Validating…';
+  const r=await fetch('/api/upload',{method:'POST',body:form});
+  const j=await r.json();
+  if(!r.ok){$('validation').innerHTML='<b class="bad">'+esc(j.error)+'</b>';return false;}
+  snapshotId=j.snapshot_id;analysisDate=j.validation.analysis_date;
+  $('validation').innerHTML='<b class="good">Loaded '+j.validation.active_accounts+' active accounts / '+
+    j.validation.active_subscriptions+' subscriptions.</b><br>Analysis date: '+esc(j.validation.analysis_date)+
+    '. Unmatched billing customers: '+j.validation.unmatched_customers+'.';
+  $('snapshotName').textContent=j.validation.active_accounts+' accounts · '+j.validation.active_subscriptions+
+    ' subscriptions · as of '+j.validation.analysis_date;
+  $('dashboard').classList.remove('hidden');
+  await runSim();
+  return true;
+}
+$('uploadForm').onsubmit=async e=>{
+  e.preventDefault();
+  if(await loadSnapshot(new FormData(e.target))) setTimeout(closeFly,900);
+};
+// The bundled extract is posted through the same /api/upload endpoint as a manual
+// upload, so it is normalized and priced by exactly the same code path.
+const SAMPLE_FILES={accounts:'accounts.csv',contracts:'contracts.csv',
+                    customers:'customers.csv',subscriptions:'subscriptions.csv'};
+async function loadSample(closeAfter){
+  $('validation').innerHTML='Loading sample data…';
+  const form=new FormData();
+  try{
+    for(const [field,file] of Object.entries(SAMPLE_FILES)){
+      const res=await fetch('/static/sample/'+file);
+      if(!res.ok) throw new Error(file);
+      form.append(field,await res.blob(),file);
+    }
+  }catch(err){
+    $('validation').innerHTML='<b class="bad">Could not load the sample files.</b>';return;
+  }
+  if(await loadSnapshot(form)&&closeAfter!==false) setTimeout(closeFly,900);
+}
+
+async function runSim(){
+  if(!snapshotId)return;
+  const cfg=config(),horizon=horizonMonths();
+  const body=JSON.stringify({snapshot_id:snapshotId,horizon_months:horizon,config:cfg});
+  const h={'Content-Type':'application/json'};
+  const [r,d]=await Promise.all([
+    fetch('/api/simulate',{method:'POST',headers:h,body}),
+    fetch('/api/distribution',{method:'POST',headers:h,body})]);
+  result=await r.json();
+  distribution=(await d.json()).distribution;
+  render();
+}
+
+/* ---------------- filters ---------------- */
+const multis={};
+function initMulti(elId,options){
+  const sig=options.join('|'),m=multis[elId];
+  if(m&&m.sig===sig)return;
+  multis[elId]={sig,options,sel:new Set(options)};
+  drawMulti(elId);
+}
+function drawMulti(elId){
+  const m=multis[elId],el=$(elId);
+  const label=m.sel.size===m.options.length?'All products':(m.sel.size?m.sel.size+' of '+m.options.length:'None selected');
+  el.innerHTML='<button type="button" data-multi-toggle="1">'+esc(label)+'</button><div class="pop">'+
+    m.options.map(o=>'<label><input type="checkbox" data-multi-opt="'+esc(o)+'"'+(m.sel.has(o)?' checked':'')+'> '+esc(o)+'</label>').join('')+
+    '<div class="sep"></div><div style="display:flex;gap:8px;padding:2px"><button type="button" class="ghost" data-multi-all="1" style="padding:5px 9px;font-size:11px">All</button>'+
+    '<button type="button" class="ghost" data-multi-none="1" style="padding:5px 9px;font-size:11px">Clear</button></div></div>';
+}
+document.addEventListener('click',e=>{
+  const host=e.target.closest('.multi');
+  document.querySelectorAll('.multi.open').forEach(el=>{if(el!==host)el.classList.remove('open');});
+  if(!host)return;
+  const m=multis[host.id];if(!m)return;
+  if(e.target.closest('[data-multi-toggle]')){host.classList.toggle('open');return;}
+  if(e.target.hasAttribute('data-multi-all')){m.options.forEach(o=>m.sel.add(o));}
+  else if(e.target.hasAttribute('data-multi-none')){m.sel.clear();}
+  else if(e.target.hasAttribute('data-multi-opt')){const o=e.target.dataset.multiOpt;e.target.checked?m.sel.add(o):m.sel.delete(o);}
+  else return;
+  const open=host.classList.contains('open');
+  drawMulti(host.id);
+  if(open)host.classList.add('open');
+  if(host.id==='fProduct')renderTable();
+});
+
+function uniq(fn){return [...new Set(result.rows.map(fn).map(v=>v==null||v===''?'Unassigned':v))].sort();}
+function syncSelect(id,values,label){
+  const el=$(id),prev=el.value;
+  const sig=values.join('|');
+  if(el.dataset.sig===sig)return;
+  el.dataset.sig=sig;
+  el.innerHTML='<option value="">'+label+'</option>'+values.map(v=>'<option>'+esc(v)+'</option>').join('');
+  if(values.includes(prev))el.value=prev;
+}
+function chartProducts(){const m=multis.__chart;return m?m.sel:null;}
+function renderChips(){
+  const products=uniq(r=>r.product);
+  if(!multis.__chart||multis.__chart.sig!==products.join('|'))
+    multis.__chart={sig:products.join('|'),options:products,sel:new Set(products)};
+  const sel=multis.__chart.sel;
+  $('chartProducts').innerHTML='<span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin-right:4px">Charts</span>'+
+    products.map(p=>'<button class="chip'+(sel.has(p)?' on':'')+'" onclick="toggleChip(\''+esc(p)+'\')">'+esc(p)+'</button>').join('');
+}
+function toggleChip(p){
+  const sel=multis.__chart.sel;
+  sel.has(p)?sel.delete(p):sel.add(p);
+  if(!sel.size)multis.__chart.options.forEach(o=>sel.add(o));
+  renderChips();renderTreatment();drawTimeline();renderDistributions();
+}
+const chartRows=()=>result.rows.filter(r=>chartProducts().has(r.product));
+function indexRows(){
+  const ae=$('fAe').value,csm=$('fCsm').value,seg=$('fSegment').value,
+        q=$('fSearch').value.trim().toLowerCase(),prod=multis.fProduct?multis.fProduct.sel:null;
+  return result.rows.filter(r=>
+    (!ae||(r.ae||'Unassigned')===ae)&&
+    (!csm||(r.csm||'Unassigned')===csm)&&
+    (!seg||r.segment===seg)&&
+    (!prod||prod.has(r.product))&&
+    (!q||String(r.account_name||'').toLowerCase().includes(q)));
+}
+
+/* ---------------- derived display values (from returned rows only) ---------------- */
+const arrBelowFloorBefore=rows=>rows.reduce((a,r)=>a+(r.unit_price<r.floor_price?(r.floor_price-r.unit_price)*r.quantity*12:0),0);
+const deferredArr=rows=>rows.reduce((a,r)=>a+(r.realized_in_horizon?0:r.arr_change),0);
+
+/* ---------------- render ---------------- */
+function render(){
+  const s=result.summary;
+  renderChips();
+  initMulti('fProduct',uniq(r=>r.product));
+  syncSelect('fAe',uniq(r=>r.ae),'All AEs');
+  syncSelect('fCsm',uniq(r=>r.csm),'All CSMs');
+  syncSelect('fSegment',uniq(r=>r.segment),'All segments');
+
+  $('tAffected').textContent=s.accounts_affected;
+  $('tAffectedSub').textContent='of '+s.accounts+' accounts · '+s.subscriptions+' priced lines';
+  $('tAvgInc').innerHTML=pct(s.arr_weighted_avg_increase_pct)+' <small>ARR-weighted</small>';
+  $('tAvgIncSub').textContent='simple average '+pct(s.avg_unit_increase_pct)+' per line';
+
+  const bf=s.pct_below_floor_before,af=s.pct_below_floor_after;
+  $('tBelowPct').innerHTML=pct(bf)+'<span class="arrow">→</span>'+pct(af);
+  $('tileBelowPct').className='tile '+(af<bf?'t-good':af>bf?'t-bad':'');
+  const abBefore=arrBelowFloorBefore(result.rows),abAfter=s.arr_left_below_floor;
+  $('tBelowArr').innerHTML='<span style="font-size:19px">'+money(abBefore)+'<span class="arrow">→</span>'+money(abAfter)+'</span>';
+  $('tileBelowArr').className='tile '+(abAfter<abBefore?'t-good':abAfter>abBefore?'t-bad':'');
+  // Discount discipline is measured as distance from list, not as a lower
+  // number: a negative average means the book has been priced through list.
+  const db=s.discount_from_list_avg_pct_before,da=s.discount_from_list_avg_pct_after;
+  $('tDiscount').innerHTML=pct(db)+'<span class="arrow">→</span>'+pct(da);
+  $('tileDiscount').className='tile '+(Math.abs(da)<Math.abs(db)?'t-good':Math.abs(da)>Math.abs(db)?'t-warn':'');
+  $('tDiscountSub').textContent=da<0?'ARR-weighted · negative means priced above list':'ARR-weighted, whole book';
+
+  $('tBreakeven').textContent=pct(s.breakeven_churn_pct,2);
+  $('tBreakevenSub').textContent='uplift nets to zero here · assuming '+pct(result.config.churn_pct)+' · '+s.breakeven_accounts+' largest accounts';
+  $('tStrategic').textContent=s.strategic_accounts;
+  $('tFloorNorm').textContent=s.floor_normalization_accounts;
+
+  $('tGross').textContent=money(s.run_rate_arr_uplift);
+  $('tChurn').textContent='−'+money(s.churn_sensitivity_loss);
+  $('tChurnSub').textContent=pct(result.config.churn_pct)+' of '+money(s.post_increase_affected_arr)+' post-increase ARR at risk';
+  $('tNet').textContent=money(s.risk_adjusted_net);
+  const def=deferredArr(result.rows);
+  $('tDeferred').textContent=money(def);
+  $('tDeferredSub').textContent=s.deferred_accounts+' accounts locked past '+s.horizon_end;
+
+  renderTreatment();renderTable();renderDistributions();drawTimeline();
+}
+
+function renderTreatment(){
+  const groups={};
+  chartRows().forEach(r=>{
+    const g=groups[r.segment]=groups[r.segment]||{accounts:new Set(),arr:0};
+    g.accounts.add(r.account_key);g.arr+=r.current_arr;});
+  const peak=Math.max(1,...Object.values(groups).map(g=>g.accounts.size));
+  $('treatment').innerHTML=Object.entries(groups).sort((a,b)=>b[1].accounts.size-a[1].accounts.size).map(([k,g])=>
+    '<div class="barrow" onclick="filterSegment(\''+esc(k)+'\')"><span><span class="pill '+segClass(k)+'">'+esc(k)+'</span></span>'+
+    '<i><em style="width:'+Math.max(4,g.accounts.size/peak*100)+'%"></em></i><b>'+g.accounts.size+'</b>'+
+    '<b class="muted">'+money(g.arr)+'</b></div>').join('')+
+    '<p style="margin-top:14px;font-size:11.5px">Accounts, then the ARR on those lines. An account with lines in two segments appears in both, so the bars can total more than the account count.</p>';
+}
+function filterSegment(seg){$('fSegment').value=seg;renderTable();$('customersCard').scrollIntoView({behavior:'smooth',block:'start'});}
+
+function segClass(seg){
+  if(seg==='Standard Increase')return 's-standard';
+  if(seg==='Floor Normalize')return 's-floor';
+  if(seg==='Strategic Legacy')return 's-strategic';
+  if(seg==='Deferred')return 's-deferred';
+  return 's-held';
+}
+function rowHtml(r){
+  return '<tr><td>'+(esc(r.account_name)||'—')+'</td>'+
+    '<td class="l"><span class="pill '+segClass(r.segment)+'">'+esc(r.segment)+'</span></td>'+
+    '<td class="l">'+(esc(r.ae)||'—')+'</td><td class="l">'+(esc(r.csm)||'—')+'</td>'+
+    '<td class="l">'+esc(r.product)+'</td><td>'+r.quantity+'</td><td>'+money2(r.unit_price)+'</td><td>'+money2(r.list_price)+'</td>'+
+    '<td>'+money2(r.floor_price)+'</td><td>'+money2(r.proposed_unit_price)+'</td>'+
+    '<td class="'+(r.price_change_pct>0?'good':'')+'">'+r.price_change_pct.toFixed(1)+'%</td>'+
+    '<td class="'+(r.discount_from_list_pct<0?'bad':'')+'">'+r.discount_from_list_pct.toFixed(1)+'%</td>'+
+    '<td>'+money(r.arr_change)+'</td><td>'+esc(r.effective_date)+'</td></tr>';
+}
+function renderTable(){
+  const rr=indexRows();
+  $('tbody').innerHTML=rr.slice(0,1000).map(rowHtml).join('');
+  $('rowCount').textContent='Showing '+Math.min(1000,rr.length)+' of '+rr.length+' lines · '+
+    new Set(rr.map(r=>r.account_key)).size+' accounts · '+money(rr.reduce((a,r)=>a+r.current_arr,0))+' current ARR'+
+    (rr.length>1000?' · table capped at 1,000 rows, export includes all':'');
+}
+
+/* ---------------- drill-down ---------------- */
+const DRILLS={
+  increased:{t:'Accounts increased',d:'Lines whose increase takes effect inside the horizon.',
+    f:rs=>rs.filter(r=>r.realized_in_horizon&&r.arr_change>0)},
+  avgIncrease:{t:'Price increase by line',d:'Every line taking effect in the horizon, largest increase first.',
+    f:rs=>rs.filter(r=>r.realized_in_horizon).sort((a,b)=>b.price_change_pct-a.price_change_pct)},
+  belowFloor:{t:'Still below floor after the cycle',d:'Lines priced under floor once the change is applied — strategic legacy accounts and capped lifts.',
+    f:rs=>rs.filter(r=>r.below_floor_after).sort((a,b)=>b.arr_left_below_floor-a.arr_left_below_floor)},
+  discount:{t:'Deepest discounts from list',d:'Lines ranked by discount off list after the change.',
+    f:rs=>[...rs].sort((a,b)=>b.discount_from_list_pct-a.discount_from_list_pct)},
+  breakeven:{t:'Accounts that carry the break-even',d:'Affected accounts by size — losing the largest of these first is what erases the uplift.',
+    f:rs=>rs.filter(r=>r.realized_in_horizon&&r.arr_change>0).sort((a,b)=>b.current_arr-a.current_arr)},
+  strategic:{t:'Strategic legacy accounts',d:'Long-tenured, high-volume accounts: standard increase only, no floor lift.',
+    f:rs=>rs.filter(r=>r.strategic_legacy)},
+  floorNorm:{t:'Floor normalization',d:'Lines the floor lifted beyond the standard increase.',
+    f:rs=>rs.filter(r=>r.segment==='Floor Normalize')},
+  churn:{t:'ARR exposed to the churn assumption',d:'Affected accounts, largest first. The sensitivity applies to their full post-increase bill.',
+    f:rs=>rs.filter(r=>r.realized_in_horizon&&r.arr_change>0).sort((a,b)=>b.current_arr-a.current_arr)},
+  deferred:{t:'Deferred outside the horizon',d:'Increases that cannot take effect before the horizon ends — mostly in-term contracts.',
+    f:rs=>rs.filter(r=>!r.realized_in_horizon).sort((a,b)=>b.arr_change-a.arr_change)}
+};
+function drill(key){
+  if(!result)return;
+  const d=DRILLS[key];drillKey=key;drillRows=d.f(result.rows);
+  $('drawerTitle').textContent=d.t;$('drawerDesc').textContent=d.d;
+  $('drawerBody').innerHTML=drillRows.slice(0,1000).map(rowHtml).join('');
+  $('drawerCount').textContent=drillRows.length+' lines · '+new Set(drillRows.map(r=>r.account_key)).size+
+    ' accounts · '+money(drillRows.reduce((a,r)=>a+r.current_arr,0))+' current ARR · '+
+    money(drillRows.reduce((a,r)=>a+r.arr_change,0))+' ARR change';
+  $('drawer').classList.add('open');
+}
+
+/* ---------------- CSV export ---------------- */
+const EXPORT_FIELDS=['subscription_item_id','stripe_customer_id','salesforce_id','account_key','match_method',
+  'account_name','csm','ae','product','billing_interval','quantity',
+  'unit_price','current_mrr','current_arr','tenure_years','last_billing_date',
+  'contract_status','contract_end_date','next_eligible_date','effective_date','realized_in_horizon',
+  'list_price','floor_price','proposed_unit_price','price_change_pct',
+  'discount_from_list_pct_before','discount_from_list_pct','arr_change','realized_revenue_in_horizon',
+  'segment','strategic_legacy','floor_binds','below_floor_before','below_floor_after','above_list_after','held_reason'];
+function csvCell(v){
+  if(v===null||v===undefined)return '';
+  if(v===true)return 'True';
+  if(v===false)return 'False';
+  let s=String(v);
+  if(/^[=+\-@\t\r]/.test(s))s="'"+s;
+  return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
+}
+function downloadCSV(rows,name){
+  const fields=EXPORT_FIELDS.slice();
+  if($('inclEmail').checked)fields.splice(1,0,'email');
+  const csv=[fields.join(',')].concat(rows.map(r=>fields.map(f=>csvCell(r[f])).join(','))).join('\r\n');
+  const u=URL.createObjectURL(new Blob([csv],{type:'text/csv'})),a=document.createElement('a');
+  a.href=u;a.download=name;a.click();URL.revokeObjectURL(u);
+}
+function slug(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'');}
+function exportCSV(){
+  if(!result)return;
+  const seg=$('fSegment').value,ae=$('fAe').value;
+  downloadCSV(indexRows(),'pricing_'+(slug(seg)||slug(ae)||'customers')+'.csv');
+}
+function exportDrill(){if(drillRows.length)downloadCSV(drillRows,'pricing_'+slug(DRILLS[drillKey].t)+'.csv');}
+
+/* ---------------- charts ---------------- */
+function fit(c){
+  const dpr=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+  c.width=w*dpr;c.height=h*dpr;
+  const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);
+  return x;
+}
+function drawTimeline(){
+  const c=$('timeline');if(!c.clientWidth)return;
+  const x=fit(c),w=c.clientWidth,h=c.clientHeight,padL=72,padR=16,padT=18,padB=32;
+  const rows=chartRows();
+  const base=rows.reduce((a,r)=>a+r.current_arr,0);
+  const ev={};
+  rows.filter(r=>r.realized_in_horizon).forEach(r=>{ev[r.effective_date]=(ev[r.effective_date]||0)+r.arr_change;});
+  const dates=Object.keys(ev).sort();
+  const t0=new Date((analysisDate||dates[0]||result.summary.horizon_end)+'T00:00:00').getTime();
+  // On "All time" the horizon end is far past the last increase, so the axis
+  // stops at the last change instead of trailing years of flat line.
+  const endDate=(isAllTime()&&dates.length)?dates[dates.length-1]:result.summary.horizon_end;
+  const t1=new Date(endDate+'T00:00:00').getTime();
+  const pts=[{t:t0,v:base}];let v=base;
+  dates.forEach(d=>{const t=new Date(d+'T00:00:00').getTime();pts.push({t,v});v+=ev[d];pts.push({t,v});});
+  pts.push({t:t1,v});
+  const lo=base,hi=Math.max(v,base*1.0001),span=(hi-lo)||1;
+  const yMin=lo-span*0.35,yMax=hi+span*0.25;
+  const sx=t=>padL+(t-t0)/((t1-t0)||1)*(w-padL-padR);
+  const sy=val=>padT+(yMax-val)/((yMax-yMin)||1)*(h-padT-padB);
+  x.strokeStyle='#1e2b3d';x.lineWidth=1;x.font='11px system-ui';
+  for(let i=0;i<=3;i++){
+    const val=yMin+(yMax-yMin)*i/3,py=sy(val);
+    x.beginPath();x.moveTo(padL,py);x.lineTo(w-padR,py);x.stroke();
+    x.fillStyle='#6d7f96';x.fillText(money(val),8,py+4);
+  }
+  const g=x.createLinearGradient(0,padT,0,h-padB);
+  g.addColorStop(0,'rgba(80,211,164,.28)');g.addColorStop(1,'rgba(80,211,164,0)');
+  x.beginPath();x.moveTo(sx(pts[0].t),sy(pts[0].v));
+  pts.forEach(p=>x.lineTo(sx(p.t),sy(p.v)));
+  x.lineTo(sx(t1),sy(base));x.closePath();x.fillStyle=g;x.fill();
+  x.setLineDash([5,5]);x.strokeStyle='#8fa1b8';x.lineWidth=2;
+  x.beginPath();x.moveTo(padL,sy(base));x.lineTo(w-padR,sy(base));x.stroke();x.setLineDash([]);
+  x.strokeStyle='#50d3a4';x.lineWidth=2.5;x.lineJoin='round';
+  x.beginPath();pts.forEach((p,i)=>i?x.lineTo(sx(p.t),sy(p.v)):x.moveTo(sx(p.t),sy(p.v)));x.stroke();
+  x.fillStyle='#8fa1b8';x.font='12px system-ui';
+  x.fillText(money(base)+' today',padL+4,sy(base)+18);
+  x.fillStyle='#50d3a4';
+  const endLabel=money(v)+' at '+endDate;
+  x.fillText(endLabel,Math.max(padL+4,w-padR-x.measureText(endLabel).width),sy(v)-10);
+  x.fillStyle='#6d7f96';x.font='11px system-ui';
+  x.fillText((analysisDate||'').slice(0,7),padL,h-10);
+  const el=endDate.slice(0,7);
+  x.fillText(el,w-padR-x.measureText(el).width,h-10);
+}
+function stats(vals){
+  const n=vals.length;if(!n)return{mean:0,sd:0};
+  const mean=vals.reduce((a,b)=>a+b,0)/n;
+  const sd=Math.sqrt(vals.reduce((a,b)=>a+(b-mean)*(b-mean),0)/Math.max(1,n-1));
+  return{mean,sd};
+}
+function kde(vals,xs){
+  const n=vals.length;if(!n)return xs.map(()=>0);
+  const {sd}=stats(vals),range=(Math.max.apply(null,vals)-Math.min.apply(null,vals))||1;
+  const bw=Math.max(1.06*sd*Math.pow(n,-0.2),range*0.03,0.01);
+  const k=1/(n*bw*Math.sqrt(2*Math.PI));
+  return xs.map(t=>{let s=0;for(let i=0;i<n;i++){const z=(t-vals[i])/bw;if(z>-5&&z<5)s+=Math.exp(-0.5*z*z);}return s*k;});
+}
+function renderDistributions(){
+  const sel=chartProducts();
+  const shown=distribution.filter(d=>sel.has(d.product));
+  $('distCharts').innerHTML=shown.map(d=>{
+    const b=stats(d.before),a=stats(d.after);
+    return '<div class="distcard"><h4>'+esc(d.product)+'</h4>'+
+      '<div class="spread">mean '+money2(b.mean)+'<span style="padding:0 5px">→</span>'+money2(a.mean)+
+      ' &nbsp;·&nbsp; spread (σ) '+money2(b.sd)+'<span style="padding:0 5px">→</span>'+money2(a.sd)+'</div>'+
+      '<canvas id="dist_'+slug(d.product)+'"></canvas></div>';
+  }).join('');
+  shown.forEach(d=>drawBell('dist_'+slug(d.product),d));
+}
+function drawBell(id,d){
+  const c=$(id);if(!c||!c.clientWidth)return;
+  const x=fit(c),w=c.clientWidth,h=c.clientHeight,padL=6,padR=6,padT=14,padB=22;
+  const all=d.before.concat(d.after).filter(v=>v>0);
+  if(!all.length)return;
+  const refs=[d.floor,d.list_price].filter(v=>v>0);
+  const lo=Math.min.apply(null,all.concat(refs)),hi=Math.max.apply(null,all.concat(refs));
+  const span=(hi-lo)||1,min=lo-span*0.12,max=hi+span*0.12;
+  const N=180,xs=[];for(let i=0;i<N;i++)xs.push(min+(max-min)*i/(N-1));
+  const cb=kde(d.before,xs),ca=kde(d.after,xs);
+  const peak=Math.max(Math.max.apply(null,cb),Math.max.apply(null,ca))||1;
+  const sx=v=>padL+(v-min)/((max-min)||1)*(w-padL-padR);
+  const sy=v=>padT+(1-v/peak)*(h-padT-padB);
+  x.strokeStyle='#1e2b3d';x.lineWidth=1;
+  x.beginPath();x.moveTo(padL,h-padB);x.lineTo(w-padR,h-padB);x.stroke();
+  function curve(vals,stroke,fill){
+    x.beginPath();x.moveTo(sx(xs[0]),h-padB);
+    for(let i=0;i<N;i++)x.lineTo(sx(xs[i]),sy(vals[i]));
+    x.lineTo(sx(xs[N-1]),h-padB);x.closePath();
+    x.fillStyle=fill;x.fill();
+    x.beginPath();for(let i=0;i<N;i++)i?x.lineTo(sx(xs[i]),sy(vals[i])):x.moveTo(sx(xs[i]),sy(vals[i]));
+    x.strokeStyle=stroke;x.lineWidth=2;x.stroke();
+  }
+  curve(cb,'#8fa1b8','rgba(143,161,184,.16)');
+  curve(ca,'#50d3a4','rgba(80,211,164,.20)');
+  function vline(v,color,label,dash){
+    if(!(v>min&&v<max))return;
+    const px=sx(v);
+    x.setLineDash(dash||[]);x.strokeStyle=color;x.lineWidth=1.5;
+    x.beginPath();x.moveTo(px,padT-6);x.lineTo(px,h-padB);x.stroke();x.setLineDash([]);
+    if(label){x.fillStyle=color;x.font='10px system-ui';
+      const tw=x.measureText(label).width;
+      x.fillText(label,Math.min(px+4,w-padR-tw),padT-1);}
+  }
+  vline(d.floor,'#ff7d8e','Floor',[4,4]);
+  vline(d.list_price,'#b894ff','List',[4,4]);
+  vline(stats(d.before).mean,'#8fa1b8','',[2,3]);
+  vline(stats(d.after).mean,'#50d3a4','',[2,3]);
+  x.fillStyle='#6d7f96';x.font='10px system-ui';
+  x.fillText(money2(min),padL,h-7);
+  const mx=money2(max);
+  x.fillText(mx,w-padR-x.measureText(mx).width,h-7);
+}
+window.addEventListener('resize',()=>{if(result){drawTimeline();renderDistributions();}});
+loadSample(false);
+</script>
+</body>
+</html>
