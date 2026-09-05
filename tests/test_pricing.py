@@ -7,7 +7,7 @@ ANALYSIS_DATE = "2026-06-15"
 # The baseline policy is the case-study policy: standard accounts get
 # max(current x (1+increase), floor), strategic legacy get current x (1+increase).
 # The governance guardrails below are an opt-in overlay, off by default.
-GUARDRAILS = {"max_increase_pct": 20.0, "hold_at_or_above_list": True, "clamp_at_list": True}
+GUARDRAILS = {"max_increase_pct": 20.0, "cap_at_list": True}
 
 
 def mk_row(**overrides):
@@ -82,10 +82,11 @@ def test_strategic_account_gets_standard_increase_only_regardless_of_cap():
         assert row["arr_left_below_floor"] == round((60 - 42.0) * 10 * 12, 2)
 
 
-def test_guardrail_holds_at_or_above_list_lines():
-    # Hiring list is 78.75. With the guardrail on, a line at or above list
-    # receives exactly zero -- both the strictly-above and the exactly-at case.
-    for price in (90, 78.75):
+def test_list_cap_holds_at_or_above_list_lines():
+    # Hiring list is 75. The cap never reaches below a customer's current
+    # price, so a line at or above list simply holds -- both the strictly-above
+    # and the exactly-at case, and neither is ever cut down to list.
+    for price in (90, 75):
         rows = [mk_row(unit_price=price, tenure_years=1)]
         row = simulate(rows, config=GUARDRAILS, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
         assert row["proposed_unit_price"] == price
@@ -93,15 +94,15 @@ def test_guardrail_holds_at_or_above_list_lines():
         assert row["segment"] == "Held (Above List)"
 
 
-def test_guardrail_clamps_a_below_list_line_at_list():
-    # 77 * 1.05 = 80.85 would cross the 78.75 list; the clamp stops it at list.
-    rows = [mk_row(unit_price=77, tenure_years=1)]
-    guarded = simulate(rows, config=GUARDRAILS, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
-    assert guarded["proposed_unit_price"] == 78.75
+def test_list_cap_stops_a_below_list_line_at_list():
+    # 73 * 1.05 = 76.65 would cross the 75 list; the cap stops it at list.
+    rows = [mk_row(unit_price=73, tenure_years=1)]
+    capped = simulate(rows, config=GUARDRAILS, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
+    assert capped["proposed_unit_price"] == 75.0
 
-    # Baseline (case-study) policy does not clamp: the standard increase applies.
+    # Baseline (case-study) policy does not cap: the standard increase applies.
     baseline = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["rows"][0]
-    assert baseline["proposed_unit_price"] == round(77 * 1.05, 4)
+    assert baseline["proposed_unit_price"] == round(73 * 1.05, 4)
 
 
 def test_zero_or_negative_price_is_held_for_review():
@@ -187,7 +188,7 @@ def test_price_distribution_before_after_buckets():
 
     hiring = dist["Hiring"]
     assert hiring["floor"] == 60.0
-    assert hiring["list_price"] == 78.75
+    assert hiring["list_price"] == 75.0
     assert hiring["before"] == sorted([45, 90])
     # 45 -> lifted to the 60 floor; 90 -> standard 5% increase (94.5), since
     # the above-list hold is an opt-in guardrail rather than baseline policy.
@@ -195,17 +196,17 @@ def test_price_distribution_before_after_buckets():
 
     payroll = dist["Payroll"]
     assert payroll["floor"] == 11.0
-    assert payroll["list_price"] == 14.70
+    assert payroll["list_price"] == 14.0
     assert payroll["before"] == [12]
     assert payroll["after"] == [round(12 * 1.05, 4)]
 
 
 def test_pct_within_10pct_of_list_and_pct_below_floor_are_arr_weighted():
     rows = [
-        # Below list-band before (68 < 70.875), lands within it after (71.4).
-        mk_row(account_key="A", product="Hiring", unit_price=68, quantity=1, current_arr=1000, tenure_years=1),
-        # Below floor before (50 < 60); capped exactly to floor (60) after,
-        # which is not below floor and not within 10% of list (78.75) either.
+        # Below the list band before (65 < 67.5), lands inside it after (68.25).
+        mk_row(account_key="A", product="Hiring", unit_price=65, quantity=1, current_arr=1000, tenure_years=1),
+        # Below floor before (50 < 60); lifted exactly to floor (60) after,
+        # which is neither below floor nor within 10% of list (75).
         mk_row(account_key="B", product="Hiring", unit_price=50, quantity=1, current_arr=3000, tenure_years=1),
     ]
     s = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["summary"]
@@ -216,10 +217,10 @@ def test_pct_within_10pct_of_list_and_pct_below_floor_are_arr_weighted():
 
 
 def test_discount_by_ae_weighted_vs_simple_average():
-    d1 = (1 - 76 / 78.75) * 100  # small discount, small account
-    d2 = (1 - 60 / 78.75) * 100  # large discount, dominant account
+    d1 = (1 - 72 / 75) * 100  # 4% off list, small account
+    d2 = (1 - 60 / 75) * 100  # 20% off list, dominant account
     rows = [
-        mk_row(account_key="X1", ae="Jordan", product="Hiring", unit_price=76, quantity=1, current_arr=500, tenure_years=1),
+        mk_row(account_key="X1", ae="Jordan", product="Hiring", unit_price=72, quantity=1, current_arr=500, tenure_years=1),
         mk_row(account_key="X2", ae="Jordan", product="Hiring", unit_price=60, quantity=1, current_arr=9500, tenure_years=1),
     ]
     s = simulate(rows, analysis_date=ANALYSIS_DATE, horizon_months=12)["summary"]
@@ -252,8 +253,8 @@ INVARIANT_BOOK = [
     mk_row(account_key="C1", product="Hiring", unit_price=40, quantity=1, current_arr=480, tenure_years=1),
     mk_row(account_key="C2", product="Hiring", unit_price=55, quantity=2, current_arr=1320, tenure_years=1),
     mk_row(account_key="C3", product="HR", unit_price=90, quantity=3, current_arr=3240, tenure_years=1),
-    mk_row(account_key="C4", product="Hiring", unit_price=77, quantity=1, current_arr=924, tenure_years=1),
-    mk_row(account_key="C5", product="Hiring", unit_price=78.75, quantity=1, current_arr=945, tenure_years=1),
+    mk_row(account_key="C4", product="Hiring", unit_price=73, quantity=1, current_arr=876, tenure_years=1),
+    mk_row(account_key="C5", product="Hiring", unit_price=75, quantity=1, current_arr=900, tenure_years=1),
     mk_row(account_key="C6", product="Hiring", unit_price=90, quantity=1, current_arr=1080, tenure_years=1),
     mk_row(account_key="C7", product="Hiring", unit_price=40, quantity=10, current_arr=4800, tenure_years=6),
     mk_row(account_key="C8", product="Payroll", unit_price=0, quantity=5, current_arr=0, tenure_years=2),

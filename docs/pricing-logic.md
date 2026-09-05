@@ -84,16 +84,19 @@ standard increase is just a standard increase.
 
 ### Optional guardrails
 
-Three extra controls, all **off by default**:
+Two extra controls, both **off by default**:
 
 | Setting | What it does |
 |---|---|
 | `max_increase_pct` | Caps how far the floor lift can go in one cycle. Bounds the floor lift only — not the standard increase. |
-| `hold_at_or_above_list` | Customers already priced at or above list get nothing. |
-| `clamp_at_list` | A price below list can rise up to list, but never through it. |
+| `cap_at_list` | List becomes a ceiling. A price below list rises up to list and stops; a price already at or above list holds where it is. |
 
-Leave all three off and you get the baseline policy above. Turn them on for a
-stricter posture where nothing is ever priced through list.
+The list cap covers both halves of the "don't price through list" rule in one
+switch. It only ever reaches *down* toward list from above, never below a
+customer's current price — so an above-list account is held rather than cut,
+and the cap can never produce a decrease.
+
+Leave both off and you get the baseline policy above.
 
 ## The two revenue numbers
 

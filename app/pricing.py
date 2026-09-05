@@ -3,15 +3,17 @@ from calendar import monthrange
 
 DEFAULT_CONFIG={
  "increase_pct":5.0,"notice_months":2,"churn_pct":3.0,"tenure_years":3.0,
- "lists":{"Hiring":78.75,"HR":105.0,"Payroll":14.70},
+ "lists":{"Hiring":75.0,"HR":100.0,"Payroll":14.0},
  "floors":{"Hiring":60.0,"HR":80.0,"Payroll":11.0},
  "high_volume":{"Hiring":7,"HR":7,"Payroll":120},
  # Optional governance guardrails, off by default. The baseline policy is the
  # case-study policy: standard = max(current x (1+increase), floor), strategic
  # legacy = current x (1+increase). Each guardrail below is an opt-in overlay.
  "max_increase_pct":None,        # cap on the floor uplift; None = uncapped
- "hold_at_or_above_list":False,  # lines at/above list receive no increase
- "clamp_at_list":False,          # a below-list line may be raised only up to list
+ # List becomes a ceiling: a price below list rises no further than list, and a
+ # price already at or above list holds where it is (the ceiling never pushes
+ # anyone down, so it can't create a decrease).
+ "cap_at_list":False,
  # Churn is a sensitivity assumption, never a forecast or an elasticity
  # estimate. "post_increase" applies churn_pct to the post-increase ARR of
  # affected accounts, which is the more conservative basis.
@@ -36,9 +38,13 @@ def _price_row(r, cfg, strategic, notice, horizon):
     is_strategic=strategic[r["account_key"]]
 
     held_reason=None; floor_binds=False
+    cap_list=bool(cfg.get("cap_at_list")) and listp>0
     if current<=0:
         proposed=current; held_reason="zero_price"
-    elif cfg.get("hold_at_or_above_list") and listp>0 and current>=listp:
+    elif cap_list and current>=listp:
+        # Already at or above list, so the ceiling leaves them exactly where
+        # they are. It never reaches down, which is why capping at list also
+        # holds these accounts instead of cutting them.
         proposed=current; held_reason="above_list"
     else:
         base=current*(1+float(cfg["increase_pct"])/100)
@@ -58,11 +64,8 @@ def _price_row(r, cfg, strategic, notice, horizon):
             proposed=floor if cap is None else min(floor,current*(1+float(cap)/100))
         else:
             proposed=base
-        # A below-list line may be raised up to list but never through it. Only
-        # applied to lines that start at or below list, so the clamp can never
-        # turn into a price decrease.
-        if cfg.get("clamp_at_list") and listp>0 and current<=listp:
-            proposed=min(proposed,listp)
+        # Below list: rise toward list and stop there.
+        if cap_list: proposed=min(proposed,listp)
 
     delta=(proposed-current)*quantity*12
     eligible=date.fromisoformat(r["next_eligible_date"]) if r.get("next_eligible_date") else None
